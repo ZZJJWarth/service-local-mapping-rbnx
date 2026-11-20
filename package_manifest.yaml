@@ -1,0 +1,39 @@
+# local_mapping_rbnx — sensor-only rolling 2.5D local map.
+#
+# Consumes only RGB, depth, camera calibration/extrinsics, lidar, odometry,
+# TF and clock. It never reads Minecraft ground truth, scene objects, block
+# identifiers or game RPC state.
+#
+# Outputs:
+#   robonix/service/local_mapping/cost_grid  nav_msgs/OccupancyGrid (0..100,-1)
+#   robonix/service/local_mapping/occupancy  nav_msgs/OccupancyGrid (debug)
+#   robonix/service/local_mapping/obstacles  sensor_msgs/PointCloud2 (debug)
+#   robonix/service/local_mapping/health     std_msgs/String (JSON)
+#
+# The local cost grid is consumed by service-navigation-rbnx's
+# terminal_controller LocalMapLayer. This service does not replace global
+# mapping or global planning.
+manifestVersion: 1
+
+package:
+  name: robonix.service.local_mapping
+  version: 0.1.0
+  description: Sensor-only rolling local occupancy/elevation/semantic map.
+  tags: [service, local-mapping, outdoor, costmap, ros2]
+  maintainers:
+    - ZZJJWarth <jzeng25@stu.pku.edu.cn>
+  license: MulanPSL-2.0
+
+build: bash scripts/build.sh
+start: bash scripts/start.sh
+stop: bash scripts/stop.sh
+
+capabilities:
+  - name: robonix/service/local_mapping/cost_grid
+    transport: ros2
+  - name: robonix/service/local_mapping/occupancy
+    transport: ros2
+  - name: robonix/service/local_mapping/obstacles
+    transport: ros2
+  - name: robonix/service/local_mapping/health
+    transport: ros2

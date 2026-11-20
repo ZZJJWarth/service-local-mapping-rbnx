@@ -1,0 +1,40 @@
+# Documentation-only defaults. The live values arrive through CMD_INIT; this
+# file is not read by the runtime.
+sensor_providers:
+  scan_rings: minecraft_mod
+  depth: minecraft_mod
+  intrinsics: minecraft_mod
+  odom: minecraft_mod
+
+map_frame: minecraft_odom
+base_frame: minecraft_view_base
+odom_frame: minecraft_odom
+# Depth arrives in the pitched camera optical frame; TF carries base -> camera.
+allowed_input_frames: [minecraft_camera_optical_frame]
+use_sim_time: true
+
+grid_size_m: 64
+publish_size_m: 32
+resolution_m: 0.2
+update_rate_hz: 10
+publish_rate_hz: 10
+
+depth_stride: 4
+depth_min_range_m: 0.25
+depth_max_range_m: 12
+lidar_min_range_m: 0.3
+lidar_max_range_m: 32
+
+ground_percentile: 10
+step_height_m: 0.55
+slope_max_deg: 35
+obstacle_min_height_m: 0.05
+obstacle_max_height_m: 2.0
+decay_seconds: 8
+
+semantic_model_path: ""
+semantic_width: 320
+semantic_height: 192
+semantic_rate_hz: 5
+semantic_conf_threshold: 0.55
+hazard_conf_threshold: 0.75

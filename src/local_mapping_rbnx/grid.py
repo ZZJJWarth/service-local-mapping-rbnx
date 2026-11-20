@@ -1,0 +1,344 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+"""Rolling 2.5D occupancy/elevation grid.
+
+All coordinates are metres in the configured odometry frame. The grid keeps a
+larger internal window than it publishes so short-range clearing and height
+history survive while the robot moves.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+
+from local_mapping_rbnx.params import MapConfig
+
+LETHAL = 100
+UNKNOWN = -1
+
+
+@dataclass(frozen=True)
+class Window:
+    cost: np.ndarray
+    occupancy: np.ndarray
+    origin_x: float
+    origin_y: float
+    resolution: float
+    obstacle_points: np.ndarray
+
+
+class RollingGrid:
+    def __init__(self, cfg: MapConfig) -> None:
+        self.cfg = cfg
+        self.n = cfg.cells
+        self.res = cfg.resolution_m
+        self.size = cfg.grid_size_m
+        self.publish_n = cfg.publish_cells
+        self.publish_size = cfg.publish_size_m
+        self.origin_x = -self.size / 2.0
+        self.origin_y = -self.size / 2.0
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.log_odds = np.zeros((self.n, self.n), dtype=np.float32)
+        self.ground_z = np.full((self.n, self.n), np.nan, dtype=np.float32)
+        self.obstacle_z = np.full((self.n, self.n), np.nan, dtype=np.float32)
+        self.seen = np.zeros((self.n, self.n), dtype=np.uint16)
+        self.last_hit = np.zeros((self.n, self.n), dtype=np.float64)
+        self.semantic_cost = np.zeros((self.n, self.n), dtype=np.uint8)
+        self.semantic_time = np.zeros((self.n, self.n), dtype=np.float64)
+
+    # ── frame / index helpers ───────────────────────────────────────────────
+    @property
+    def center_x(self) -> float:
+        return self.origin_x + self.size / 2.0
+
+    @property
+    def center_y(self) -> float:
+        return self.origin_y + self.size / 2.0
+
+    def world_to_index(self, x: np.ndarray | float, y: np.ndarray | float):
+        cols = np.floor((np.asarray(x) - self.origin_x) / self.res).astype(np.int64)
+        rows = np.floor((np.asarray(y) - self.origin_y) / self.res).astype(np.int64)
+        return cols, rows
+
+    def index_to_world(self, cols: np.ndarray, rows: np.ndarray):
+        return (
+            self.origin_x + (np.asarray(cols) + 0.5) * self.res,
+            self.origin_y + (np.asarray(rows) + 0.5) * self.res,
+        )
+
+    def set_robot(self, x: float, y: float) -> None:
+        self.robot_x = float(x)
+        self.robot_y = float(y)
+        self.ensure_centered()
+
+    def ensure_centered(self) -> None:
+        margin = max(self.res, (self.size - self.publish_size) / 4.0)
+        if abs(self.robot_x - self.center_x) <= margin and abs(self.robot_y - self.center_y) <= margin:
+            return
+        shift_cols = int(round((self.robot_x - self.center_x) / self.res))
+        shift_rows = int(round((self.robot_y - self.center_y) / self.res))
+        if shift_cols:
+            self._shift_axis(cols=shift_cols)
+        if shift_rows:
+            self._shift_axis(rows=shift_rows)
+        self.origin_x += shift_cols * self.res
+        self.origin_y += shift_rows * self.res
+
+    def _shift_axis(self, cols: int = 0, rows: int = 0) -> None:
+        for name, fill in (
+            ("log_odds", 0.0),
+            ("ground_z", np.nan),
+            ("obstacle_z", np.nan),
+            ("seen", 0),
+            ("last_hit", 0.0),
+            ("semantic_cost", 0),
+            ("semantic_time", 0.0),
+        ):
+            array = getattr(self, name)
+            shifted = np.roll(array, (-rows, -cols), axis=(0, 1))
+            if rows > 0:
+                shifted[:rows, :] = fill
+            elif rows < 0:
+                shifted[rows:, :] = fill
+            if cols > 0:
+                shifted[:, :cols] = fill
+            elif cols < 0:
+                shifted[:, cols:] = fill
+            setattr(self, name, shifted)
+
+    # ── integration ─────────────────────────────────────────────────────────
+    def integrate_lidar(
+        self,
+        origin_xy: tuple[float, float],
+        endpoints: np.ndarray,
+        stamp: float,
+        ground_reference_z: float,
+    ) -> int:
+        """Integrate transformed lidar endpoints and clear the rays behind them."""
+        if endpoints.size == 0:
+            return 0
+        points = np.asarray(endpoints, dtype=np.float64).reshape(-1, 3)
+        finite = np.isfinite(points).all(axis=1)
+        points = points[finite]
+        if points.size == 0:
+            return 0
+        ox, oy = float(origin_xy[0]), float(origin_xy[1])
+        accepted = 0
+        min_z = ground_reference_z + self.cfg.obstacle_min_height_m
+        max_z = ground_reference_z + self.cfg.obstacle_max_height_m
+        for x, y, z in points:
+            dist = math.hypot(x - ox, y - oy)
+            if dist < self.cfg.lidar_min_range_m or dist > self.cfg.lidar_max_range_m:
+                continue
+            self._clear_ray(ox, oy, x, y, stamp)
+            if z < min_z or z > max_z:
+                continue
+            cols, rows = self.world_to_index(x, y)
+            if not (0 <= cols < self.n and 0 <= rows < self.n):
+                continue
+            self._mark_occupied(int(cols), int(rows), z, stamp)
+            accepted += 1
+        return accepted
+
+    def _clear_ray(self, x0: float, y0: float, x1: float, y1: float, stamp: float) -> None:
+        dx, dy = x1 - x0, y1 - y0
+        dist = math.hypot(dx, dy)
+        if dist <= self.res:
+            return
+        steps = int(math.ceil(dist / self.res))
+        if steps < 2:
+            return
+        fractions = np.linspace(0.0, 1.0, steps + 1, endpoint=False)[1:-1]
+        if fractions.size == 0:
+            return
+        xs = x0 + dx * fractions
+        ys = y0 + dy * fractions
+        cols, rows = self.world_to_index(xs, ys)
+        valid = (cols >= 0) & (cols < self.n) & (rows >= 0) & (rows < self.n)
+        if not np.any(valid):
+            return
+        flat = rows[valid] * self.n + cols[valid]
+        flat = np.unique(flat)
+        r = flat // self.n
+        c = flat % self.n
+        self.seen[r, c] = np.minimum(self.seen[r, c].astype(np.uint32) + 1, 65535).astype(np.uint16)
+        self.log_odds[r, c] = np.maximum(
+            self.log_odds[r, c] - self.cfg.log_odds_free, self.cfg.log_odds_min
+        )
+
+    def _mark_occupied(self, col: int, row: int, z: float, stamp: float) -> None:
+        self.seen[row, col] = min(int(self.seen[row, col]) + 1, 65535)
+        self.log_odds[row, col] = min(
+            float(self.log_odds[row, col]) + self.cfg.log_odds_occupied,
+            self.cfg.log_odds_max,
+        )
+        current = self.obstacle_z[row, col]
+        self.obstacle_z[row, col] = z if not np.isfinite(current) else max(float(current), z)
+        self.last_hit[row, col] = stamp
+
+    def integrate_depth(
+        self,
+        points: np.ndarray,
+        stamp: float,
+        robot_ground_z: float,
+    ) -> int:
+        """Cluster map-frame depth returns per cell into ground and obstacles."""
+        if points.size == 0:
+            return 0
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        pts = pts[np.isfinite(pts).all(axis=1)]
+        if pts.size == 0:
+            return 0
+        cols, rows = self.world_to_index(pts[:, 0], pts[:, 1])
+        valid = (cols >= 0) & (cols < self.n) & (rows >= 0) & (rows < self.n)
+        if not np.any(valid):
+            return 0
+        pts = pts[valid]
+        cols = cols[valid]
+        rows = rows[valid]
+        flat = rows * self.n + cols
+        order = np.argsort(flat, kind="stable")
+        flat = flat[order]
+        zs = pts[order, 2]
+        unique, starts = np.unique(flat, return_index=True)
+        ends = np.r_[starts[1:], len(flat)]
+        accepted = 0
+        percentile = float(self.cfg.ground_percentile)
+        for idx, start, end in zip(unique, starts, ends):
+            r, c = divmod(int(idx), self.n)
+            cell_z = zs[start:end]
+            z_min = float(np.min(cell_z))
+            z_max = float(np.max(cell_z))
+            tracked = self.ground_z[r, c]
+            local_ground = float(tracked) if np.isfinite(tracked) else float(robot_ground_z)
+            # A depth cluster that rises well above the local ground is an
+            # obstacle; a low cluster seeds or updates the ground estimate.
+            if z_max - local_ground > self.cfg.step_height_m:
+                if z_max - local_ground <= self.cfg.obstacle_max_height_m:
+                    self._mark_occupied(c, r, z_max, stamp)
+                    accepted += 1
+                continue
+            candidate = float(np.percentile(cell_z, percentile))
+            self.ground_z[r, c] = candidate if not np.isfinite(tracked) else (
+                0.75 * float(tracked) + 0.25 * candidate
+            )
+            self.seen[r, c] = min(int(self.seen[r, c]) + 1, 65535)
+        return accepted
+
+    def integrate_semantic(self, points: np.ndarray, cost: int, stamp: float) -> int:
+        if points.size == 0 or cost <= 0:
+            return 0
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        cols, rows = self.world_to_index(pts[:, 0], pts[:, 1])
+        valid = (cols >= 0) & (cols < self.n) & (rows >= 0) & (rows < self.n)
+        if not np.any(valid):
+            return 0
+        cols, rows = cols[valid], rows[valid]
+        flat = np.unique(rows * self.n + cols)
+        r = flat // self.n
+        c = flat % self.n
+        self.semantic_cost[r, c] = np.maximum(self.semantic_cost[r, c], np.uint8(cost))
+        self.semantic_time[r, c] = stamp
+        return int(flat.size)
+
+    def decay(self, now: float, dt: float) -> None:
+        if self.cfg.decay_seconds <= 0 or dt <= 0:
+            return
+        factor = math.exp(-dt / self.cfg.decay_seconds)
+        positive = self.log_odds > 0
+        self.log_odds[positive] = np.maximum(
+            self.log_odds[positive] * factor, 0.0
+        )
+        stale = self.log_odds < 0.05
+        self.obstacle_z[stale] = np.nan
+        self.semantic_cost = (self.semantic_cost.astype(np.float32) * factor).astype(np.uint8)
+        self.semantic_cost[self.semantic_cost < 5] = 0
+
+    # ── publication ─────────────────────────────────────────────────────────
+    def window(self, robot_xy: tuple[float, float]) -> Window:
+        self.set_robot(*robot_xy)
+        col0 = int(round((self.robot_x - self.publish_size / 2.0 - self.origin_x) / self.res))
+        row0 = int(round((self.robot_y - self.publish_size / 2.0 - self.origin_y) / self.res))
+        origin_x = self.origin_x + col0 * self.res
+        origin_y = self.origin_y + row0 * self.res
+
+        cost = np.full((self.publish_n, self.publish_n), UNKNOWN, dtype=np.int8)
+        occupancy = np.full((self.publish_n, self.publish_n), UNKNOWN, dtype=np.int8)
+        obstacle_points: list[tuple[float, float, float]] = []
+
+        src_c0 = max(0, col0)
+        src_r0 = max(0, row0)
+        src_c1 = min(self.n, col0 + self.publish_n)
+        src_r1 = min(self.n, row0 + self.publish_n)
+        if src_c1 <= src_c0 or src_r1 <= src_r0:
+            return Window(cost, occupancy, origin_x, origin_y, self.res, np.zeros((0, 3)))
+
+        dst_c0 = src_c0 - col0
+        dst_r0 = src_r0 - row0
+        dst_c1 = dst_c0 + (src_c1 - src_c0)
+        dst_r1 = dst_r0 + (src_r1 - src_r0)
+        sl_src = np.s_[src_r0:src_r1, src_c0:src_c1]
+        sl_dst = np.s_[dst_r0:dst_r1, dst_c0:dst_c1]
+
+        log_odds = self.log_odds[sl_src]
+        seen = self.seen[sl_src]
+        occupied = (seen > 0) & (log_odds >= 0.5)
+        free = (seen > 0) & (log_odds <= 0.1)
+        uncertain = (seen > 0) & ~occupied & ~free
+        block = cost[sl_dst]
+        block[...] = UNKNOWN
+        block[free] = 0
+        block[uncertain] = 45
+        block[occupied] = LETHAL
+
+        semantic = self.semantic_cost[sl_src].astype(np.int16)
+        semantic[occupied] = 0
+        block_sem = cost[sl_dst]
+        semantic_mask = semantic > 0
+        block_sem[semantic_mask] = np.maximum(
+            block_sem[semantic_mask], semantic[semantic_mask].astype(np.int8)
+        )
+
+        # A steep ground cell is not collision-free even without a vertical return.
+        ground = self.ground_z[sl_src]
+        slopes = self._slope(ground)
+        steep = np.isfinite(slopes) & (slopes > math.radians(self.cfg.slope_max_deg))
+        block_sem[steep] = np.maximum(block_sem[steep], 90)
+
+        prob = 1.0 / (1.0 + np.exp(-log_odds.astype(np.float32)))
+        occ = occupancy[sl_dst]
+        occ[...] = UNKNOWN
+        known = seen > 0
+        occ[known] = 0
+        occ[known & (prob >= 0.65)] = 100
+        occ[known & (prob >= 0.85)] = LETHAL
+
+        hit_r, hit_c = np.where(occupied)
+        if hit_r.size:
+            wx, wy = self.index_to_world(hit_c + src_c0, hit_r + src_r0)
+            wz = self.obstacle_z[sl_src][occupied]
+            obstacle_points = list(zip(wx.tolist(), wy.tolist(), wz.tolist()))
+        obstacle_array = (
+            np.asarray(obstacle_points, dtype=np.float64)
+            if obstacle_points else np.zeros((0, 3), dtype=np.float64)
+        )
+        return Window(cost, occupancy, origin_x, origin_y, self.res, obstacle_array)
+
+    def _slope(self, ground: np.ndarray) -> np.ndarray:
+        slope = np.full(ground.shape, np.nan, dtype=np.float32)
+        diff = np.full(ground.shape, np.nan, dtype=np.float32)
+        diff[:-1, :] = np.abs(np.diff(ground, axis=0)) / self.res
+        slope = np.where(np.isnan(slope), diff, np.fmax(slope, diff))
+        diff = np.full(ground.shape, np.nan, dtype=np.float32)
+        diff[:, :-1] = np.abs(np.diff(ground, axis=1)) / self.res
+        slope = np.where(np.isnan(slope), diff, np.fmax(slope, diff))
+        return slope
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "occupied_cells": int(np.count_nonzero(self.log_odds >= 0.5)),
+            "free_cells": int(np.count_nonzero((self.seen > 0) & (self.log_odds <= 0.1))),
+            "semantic_cells": int(np.count_nonzero(self.semantic_cost > 0)),
+        }
