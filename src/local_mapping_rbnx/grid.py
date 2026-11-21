@@ -45,6 +45,7 @@ class RollingGrid:
         self.obstacle_z = np.full((self.n, self.n), np.nan, dtype=np.float32)
         self.seen = np.zeros((self.n, self.n), dtype=np.uint16)
         self.last_hit = np.zeros((self.n, self.n), dtype=np.float64)
+        self.stale_obstacle = np.zeros((self.n, self.n), dtype=bool)
         self.semantic_cost = np.zeros((self.n, self.n), dtype=np.uint8)
         self.semantic_time = np.zeros((self.n, self.n), dtype=np.float64)
 
@@ -86,6 +87,22 @@ class RollingGrid:
         self.origin_x += shift_cols * self.res
         self.origin_y += shift_rows * self.res
 
+    def reset(self, robot_xy: tuple[float, float] | None = None) -> None:
+        """Clear all grid layers and recenter around the robot."""
+        if robot_xy is not None:
+            self.robot_x = float(robot_xy[0])
+            self.robot_y = float(robot_xy[1])
+        self.origin_x = self.robot_x - self.size / 2.0
+        self.origin_y = self.robot_y - self.size / 2.0
+        self.log_odds.fill(0.0)
+        self.ground_z.fill(np.nan)
+        self.obstacle_z.fill(np.nan)
+        self.seen.fill(0)
+        self.last_hit.fill(0.0)
+        self.stale_obstacle.fill(False)
+        self.semantic_cost.fill(0)
+        self.semantic_time.fill(0.0)
+
     def _shift_axis(self, cols: int = 0, rows: int = 0) -> None:
         for name, fill in (
             ("log_odds", 0.0),
@@ -93,19 +110,23 @@ class RollingGrid:
             ("obstacle_z", np.nan),
             ("seen", 0),
             ("last_hit", 0.0),
+            ("stale_obstacle", False),
             ("semantic_cost", 0),
             ("semantic_time", 0.0),
         ):
             array = getattr(self, name)
+            if abs(rows) >= self.n or abs(cols) >= self.n:
+                array.fill(fill)
+                continue
             shifted = np.roll(array, (-rows, -cols), axis=(0, 1))
             if rows > 0:
-                shifted[:rows, :] = fill
+                shifted[-rows:, :] = fill
             elif rows < 0:
-                shifted[rows:, :] = fill
+                shifted[:-rows, :] = fill
             if cols > 0:
-                shifted[:, :cols] = fill
+                shifted[:, -cols:] = fill
             elif cols < 0:
-                shifted[:, cols:] = fill
+                shifted[:, :-cols] = fill
             setattr(self, name, shifted)
 
     # ── integration ─────────────────────────────────────────────────────────
@@ -116,7 +137,7 @@ class RollingGrid:
         stamp: float,
         ground_reference_z: float,
     ) -> int:
-        """Integrate transformed lidar endpoints and clear the rays behind them."""
+        """Integrate transformed lidar endpoints with height-aware, once-per-frame ray clearing."""
         if endpoints.size == 0:
             return 0
         points = np.asarray(endpoints, dtype=np.float64).reshape(-1, 3)
@@ -128,21 +149,38 @@ class RollingGrid:
         accepted = 0
         min_z = ground_reference_z + self.cfg.obstacle_min_height_m
         max_z = ground_reference_z + self.cfg.obstacle_max_height_m
+
+        hit_flat: set[int] = set()
+        clear_min_z: dict[int, float] = {}
+
         for x, y, z in points:
             dist = math.hypot(x - ox, y - oy)
             if dist < self.cfg.lidar_min_range_m or dist > self.cfg.lidar_max_range_m:
                 continue
-            self._clear_ray(ox, oy, x, y, stamp)
+            self._collect_ray_cells(ox, oy, x, y, float(z), clear_min_z)
             if z < min_z or z > max_z:
                 continue
             cols, rows = self.world_to_index(x, y)
             if not (0 <= cols < self.n and 0 <= rows < self.n):
                 continue
-            self._mark_occupied(int(cols), int(rows), z, stamp)
+            c_int, r_int = int(cols), int(rows)
+            hit_flat.add(r_int * self.n + c_int)
+            self._mark_occupied(c_int, r_int, float(z), stamp)
             accepted += 1
+
+        if clear_min_z:
+            self._apply_ray_clearing(clear_min_z, hit_flat)
         return accepted
 
-    def _clear_ray(self, x0: float, y0: float, x1: float, y1: float, stamp: float) -> None:
+    def _collect_ray_cells(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        ray_z: float,
+        clear_min_z: dict[int, float],
+    ) -> None:
         dx, dy = x1 - x0, y1 - y0
         dist = math.hypot(dx, dy)
         if dist <= self.res:
@@ -159,14 +197,42 @@ class RollingGrid:
         valid = (cols >= 0) & (cols < self.n) & (rows >= 0) & (rows < self.n)
         if not np.any(valid):
             return
-        flat = rows[valid] * self.n + cols[valid]
-        flat = np.unique(flat)
+        flat = np.unique(rows[valid] * self.n + cols[valid])
+        for idx in flat.tolist():
+            prev = clear_min_z.get(idx)
+            if prev is None or ray_z < prev:
+                clear_min_z[idx] = ray_z
+
+    def _apply_ray_clearing(
+        self, clear_min_z: dict[int, float], hit_flat: set[int]
+    ) -> None:
+        for idx in hit_flat:
+            clear_min_z.pop(idx, None)
+        if not clear_min_z:
+            return
+        flat = np.fromiter(clear_min_z.keys(), dtype=np.int64, count=len(clear_min_z))
+        ray_zs = np.fromiter(clear_min_z.values(), dtype=np.float32, count=len(clear_min_z))
         r = flat // self.n
         c = flat % self.n
-        self.seen[r, c] = np.minimum(self.seen[r, c].astype(np.uint32) + 1, 65535).astype(np.uint16)
+
+        # A high-ring ray passing over a shorter obstacle must not clear it.
+        obs_z = self.obstacle_z[r, c]
+        allow = ~np.isfinite(obs_z) | (ray_zs <= obs_z + 0.15)
+        if not np.any(allow):
+            return
+        r = r[allow]
+        c = c[allow]
+        self.seen[r, c] = np.minimum(
+            self.seen[r, c].astype(np.uint32) + 1, 65535
+        ).astype(np.uint16)
         self.log_odds[r, c] = np.maximum(
             self.log_odds[r, c] - self.cfg.log_odds_free, self.cfg.log_odds_min
         )
+        cleared = self.log_odds[r, c] <= -1.5
+        if np.any(cleared):
+            rc_r, rc_c = r[cleared], c[cleared]
+            self.stale_obstacle[rc_r, rc_c] = False
+            self.obstacle_z[rc_r, rc_c] = np.nan
 
     def _mark_occupied(self, col: int, row: int, z: float, stamp: float) -> None:
         self.seen[row, col] = min(int(self.seen[row, col]) + 1, 65535)
@@ -174,6 +240,8 @@ class RollingGrid:
             float(self.log_odds[row, col]) + self.cfg.log_odds_occupied,
             self.cfg.log_odds_max,
         )
+        if self.log_odds[row, col] >= 0.5:
+            self.stale_obstacle[row, col] = True
         current = self.obstacle_z[row, col]
         self.obstacle_z[row, col] = z if not np.isfinite(current) else max(float(current), z)
         self.last_hit[row, col] = stamp
@@ -291,10 +359,28 @@ class RollingGrid:
         block[...] = UNKNOWN
         block[free] = 0
         block[uncertain] = 45
-        block[occupied] = LETHAL
+
+        if self.cfg.stale_obstacle_cost > 0:
+            cols_idx = np.arange(src_c0, src_c1, dtype=np.float32)
+            rows_idx = np.arange(src_r0, src_r1, dtype=np.float32)
+            wx_axis = self.origin_x + (cols_idx + 0.5) * self.res
+            wy_axis = self.origin_y + (rows_idx + 0.5) * self.res
+            dist2 = (wx_axis[None, :] - self.robot_x) ** 2 + (
+                wy_axis[:, None] - self.robot_y
+            ) ** 2
+            in_obs = dist2 <= (self.cfg.observation_radius_m ** 2)
+            fresh_occupied = occupied & in_obs
+            stale_mask = (occupied & ~in_obs) | (
+                self.stale_obstacle[sl_src] & ~fresh_occupied
+            )
+            block[stale_mask] = np.int8(self.cfg.stale_obstacle_cost)
+            block[fresh_occupied] = LETHAL
+        else:
+            fresh_occupied = occupied
+            block[fresh_occupied] = LETHAL
 
         semantic = self.semantic_cost[sl_src].astype(np.int16)
-        semantic[occupied] = 0
+        semantic[fresh_occupied] = 0
         block_sem = cost[sl_dst]
         semantic_mask = semantic > 0
         block_sem[semantic_mask] = np.maximum(
@@ -307,6 +393,11 @@ class RollingGrid:
         steep = np.isfinite(slopes) & (slopes > math.radians(self.cfg.slope_max_deg))
         block_sem[steep] = np.maximum(block_sem[steep], 90)
 
+        if self.cfg.wall_aversion_radius_m > 0.0 and self.cfg.wall_aversion_max_cost > 0:
+            repulsion = self._wall_aversion(block >= LETHAL)
+            apply_mask = (block >= 0) & (block < LETHAL) & (repulsion > 0)
+            block[apply_mask] = np.maximum(block[apply_mask], repulsion[apply_mask])
+
         prob = 1.0 / (1.0 + np.exp(-log_odds.astype(np.float32)))
         occ = occupancy[sl_dst]
         occ[...] = UNKNOWN
@@ -315,16 +406,54 @@ class RollingGrid:
         occ[known & (prob >= 0.65)] = 100
         occ[known & (prob >= 0.85)] = LETHAL
 
-        hit_r, hit_c = np.where(occupied)
+        hit_r, hit_c = np.where(fresh_occupied)
         if hit_r.size:
             wx, wy = self.index_to_world(hit_c + src_c0, hit_r + src_r0)
-            wz = self.obstacle_z[sl_src][occupied]
+            wz = self.obstacle_z[sl_src][fresh_occupied]
             obstacle_points = list(zip(wx.tolist(), wy.tolist(), wz.tolist()))
         obstacle_array = (
             np.asarray(obstacle_points, dtype=np.float64)
             if obstacle_points else np.zeros((0, 3), dtype=np.float64)
         )
         return Window(cost, occupancy, origin_x, origin_y, self.res, obstacle_array)
+
+    def _wall_aversion(self, lethal_mask: np.ndarray) -> np.ndarray:
+        """Compute soft repulsion cost around lethal cells via separable 2-pass EDT."""
+        out = np.zeros(lethal_mask.shape, dtype=np.int8)
+        if not np.any(lethal_mask):
+            return out
+        radius_m = float(self.cfg.wall_aversion_radius_m)
+        max_cost = int(self.cfg.wall_aversion_max_cost)
+        rad_cells = int(math.ceil(radius_m / self.res))
+        if rad_cells <= 0 or max_cost <= 0:
+            return out
+        h, w = lethal_mask.shape
+        inf = float((rad_cells + 1) ** 2 + 1)
+
+        # Pass 1: horizontal minimum squared cell distance to any lethal cell.
+        dx2 = np.where(lethal_mask, 0.0, inf).astype(np.float32)
+        for dc in range(1, rad_cells + 1):
+            c2 = float(dc * dc)
+            if dc < w:
+                left = np.where(lethal_mask[:, :-dc], c2, inf)
+                dx2[:, dc:] = np.minimum(dx2[:, dc:], left)
+                right = np.where(lethal_mask[:, dc:], c2, inf)
+                dx2[:, :-dc] = np.minimum(dx2[:, :-dc], right)
+
+        # Pass 2: vertical minimum squared cell distance (exact 2D squared EDT).
+        d2 = dx2.copy()
+        for dr in range(1, rad_cells + 1):
+            r2 = float(dr * dr)
+            if dr < h:
+                d2[dr:, :] = np.minimum(d2[dr:, :], dx2[:-dr, :] + r2)
+                d2[:-dr, :] = np.minimum(d2[:-dr, :], dx2[dr:, :] + r2)
+
+        dist_m = np.sqrt(d2) * float(self.res)
+        band = (dist_m > 0.0) & (dist_m <= radius_m)
+        if np.any(band):
+            falloff = np.power(1.0 - dist_m[band] / radius_m, 1.5)
+            out[band] = np.clip(np.rint(max_cost * falloff), 1, max_cost).astype(np.int8)
+        return out
 
     def _slope(self, ground: np.ndarray) -> np.ndarray:
         slope = np.full(ground.shape, np.nan, dtype=np.float32)
@@ -340,5 +469,6 @@ class RollingGrid:
         return {
             "occupied_cells": int(np.count_nonzero(self.log_odds >= 0.5)),
             "free_cells": int(np.count_nonzero((self.seen > 0) & (self.log_odds <= 0.1))),
+            "stale_obstacle_cells": int(np.count_nonzero(self.stale_obstacle)),
             "semantic_cells": int(np.count_nonzero(self.semantic_cost > 0)),
         }

@@ -6,7 +6,10 @@ math stay in pure modules so they can be tested without a ROS graph.
 """
 from __future__ import annotations
 
+import base64
 import json
+import logging
+import math
 import threading
 import time
 from collections import deque
@@ -15,9 +18,21 @@ from typing import Any
 import numpy as np
 
 from local_mapping_rbnx import frames, sensors, topics
-from local_mapping_rbnx.grid import RollingGrid
+from local_mapping_rbnx.grid import RollingGrid, Window
 from local_mapping_rbnx.params import MapConfig
 from local_mapping_rbnx.semantics import SemanticSegmenter, depth_selected_points
+from local_mapping_rbnx.webui import LocalMapWebUI, WebNavigationController
+
+log = logging.getLogger("local_mapping_rbnx.node")
+MAX_WEBUI_OBSTACLES = 2000
+
+
+def _quat_yaw(q) -> float:
+    x = float(getattr(q, "x", 0.0))
+    y = float(getattr(q, "y", 0.0))
+    z = float(getattr(q, "z", 0.0))
+    w = float(getattr(q, "w", 1.0))
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 class LocalMapNode:
@@ -39,9 +54,13 @@ class LocalMapNode:
         self._sem_stop = threading.Event()
         self._sem_thread: threading.Thread | None = None
         self._intrinsics: sensors.Intrinsics | None = None
-        self._latest_odom: tuple[float, float, float, float] | None = None
+        self._latest_odom: tuple[float, float, float, float, float] | None = None
         self._last_grid_time = 0.0
         self._last_semantic_time = 0.0
+        self._last_window: Window | None = None
+        self._last_robot_pose: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._last_publish_wall = 0.0
+        self._webui: LocalMapWebUI | None = None
         self._counters: dict[str, int] = {
             "frames": 0,
             "frames_dropped_frame": 0,
@@ -104,6 +123,33 @@ class LocalMapNode:
                 target=self._semantic_loop, name="local-map-semantics", daemon=True
             )
             self._sem_thread.start()
+        if self.cfg.webui_enabled and self.cfg.webui_port > 0:
+            nav_controller = WebNavigationController(
+                frame_id=self.cfg.map_frame,
+                cell_validator=self.validate_goal_cell,
+                robot_pose_provider=self._robot_pose,
+            )
+            webui = LocalMapWebUI(
+                self.cfg.webui_host,
+                self.cfg.webui_port,
+                self.webui_snapshot,
+                self.health_payload,
+                nav_controller=nav_controller,
+                reset_fn=self.reset_map,
+                visual_object_url=self.cfg.visual_object_url,
+            )
+            try:
+                webui.start()
+                self._webui = webui
+            except OSError as exc:
+                log.warning(
+                    "failed to start local map web UI on %s:%d: %s",
+                    self.cfg.webui_host,
+                    self.cfg.webui_port,
+                    exc,
+                )
+                with self.lock:
+                    self._last_error = f"webui bind failed: {exc}"
 
     def _spin(self) -> None:
         try:
@@ -113,6 +159,9 @@ class LocalMapNode:
                 self._last_error = "ros spin stopped"
 
     def stop(self) -> None:
+        webui, self._webui = self._webui, None
+        if webui is not None:
+            webui.stop()
         self._sem_stop.set()
         if self._sem_thread is not None:
             self._sem_thread.join(timeout=2.0)
@@ -207,6 +256,7 @@ class LocalMapNode:
                     float(pose.position.x),
                     float(pose.position.y),
                     float(pose.position.z),
+                    _quat_yaw(pose.orientation),
                     frames.stamp_seconds(message),
                 )
             return
@@ -281,10 +331,23 @@ class LocalMapNode:
     def _transform_points(self, points: np.ndarray, frame: str, stamp):
         if points.size == 0:
             return None, np.zeros((0, 3))
+        transform = None
         try:
-            transform = self._lookup(self.cfg.map_frame, frame, stamp)
+            transform = self._lookup(self.cfg.map_frame, frame, stamp, timeout=0.0)
         except Exception:  # noqa: BLE001
-            return None, points
+            try:
+                candidate = self._lookup(self.cfg.map_frame, frame, None, timeout=0.0)
+            except Exception:  # noqa: BLE001
+                return None, points
+            msg_sec = (
+                float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) * 1e-9
+                if stamp is not None
+                else 0.0
+            )
+            tf_sec = frames.stamp_seconds(candidate)
+            if msg_sec > 0.0 and tf_sec > 0.0 and abs(msg_sec - tf_sec) > self.cfg.max_tf_age_s:
+                return None, points
+            transform = candidate
         translated = frames.transform_points(
             points, transform.transform.translation, transform.transform.rotation
         )
@@ -472,28 +535,40 @@ class LocalMapNode:
             self._counters["semantic_points"] += integrated
 
     # ── publication ─────────────────────────────────────────────────────────
+    def _robot_pose(self) -> tuple[float, float, float]:
+        if self.tf_buffer is not None:
+            try:
+                transform = self._lookup(
+                    self.cfg.map_frame, self.cfg.base_frame, None, timeout=0.0
+                )
+                return (
+                    float(transform.transform.translation.x),
+                    float(transform.transform.translation.y),
+                    _quat_yaw(transform.transform.rotation),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        with self.lock:
+            odom = self._latest_odom
+        if odom is not None:
+            return odom[0], odom[1], odom[3]
+        return 0.0, 0.0, 0.0
+
     def _robot_xy(self) -> tuple[float, float]:
-        try:
-            transform = self._lookup(self.cfg.map_frame, self.cfg.base_frame, None, timeout=0.0)
-            return (
-                float(transform.transform.translation.x),
-                float(transform.transform.translation.y),
-            )
-        except Exception:  # noqa: BLE001
-            with self.lock:
-                odom = self._latest_odom
-            if odom is not None:
-                return odom[0], odom[1]
-        return 0.0, 0.0
+        x, y, _ = self._robot_pose()
+        return x, y
 
     def _publish(self) -> None:
         from nav_msgs.msg import OccupancyGrid
         from sensor_msgs.msg import PointCloud2, PointField
         from std_msgs.msg import Header
 
-        x, y = self._robot_xy()
+        x, y, yaw = self._robot_pose()
         with self.lock:
             window = self.grid.window((x, y))
+            self._last_window = window
+            self._last_robot_pose = (x, y, yaw)
+            self._last_publish_wall = time.time()
         stamp = self.node.get_clock().now().to_msg()
         header = Header(stamp=stamp, frame_id=self.cfg.map_frame)
         self._publishers["cost_grid"].publish(
@@ -536,11 +611,21 @@ class LocalMapNode:
         msg.data = data.flatten().tolist()
         return msg
 
-    def _publish_health(self) -> None:
-        from std_msgs.msg import String
-
+    def reset_map(self) -> dict[str, Any]:
+        rx, ry, _ = self._robot_pose()
         with self.lock:
-            payload = {
+            self.grid.reset((rx, ry))
+            self._last_window = None
+        log.info("local map reset around (%.2f, %.2f)", rx, ry)
+        return {
+            "ok": True,
+            "detail": f"local map reset around ({rx:.2f}, {ry:.2f})",
+            "robot": {"x": round(rx, 3), "y": round(ry, 3)},
+        }
+
+    def health_payload(self) -> dict[str, Any]:
+        with self.lock:
+            return {
                 "ok": self._ros_started,
                 "frame": self.cfg.map_frame,
                 "semantics_enabled": self.segmenter.enabled,
@@ -549,4 +634,105 @@ class LocalMapNode:
                 "grid": self.grid.stats(),
                 "last_error": self._last_error,
             }
-        self._publishers["health"].publish(String(data=json.dumps(payload)))
+
+    def validate_goal_cell(self, x: float, y: float) -> tuple[bool, str]:
+        with self.lock:
+            window = self._last_window
+            if window is None:
+                rx, ry = (
+                    (self._latest_odom[0], self._latest_odom[1])
+                    if self._latest_odom is not None
+                    else (self.grid.robot_x, self.grid.robot_y)
+                )
+                window = self.grid.window((rx, ry))
+        col = int(math.floor((x - window.origin_x) / window.resolution))
+        row = int(math.floor((y - window.origin_y) / window.resolution))
+        height, width = window.cost.shape
+        if col < 0 or row < 0 or col >= width or row >= height:
+            return False, "goal is outside the local map window"
+        cost_val = int(window.cost[row, col])
+        if cost_val >= 100:
+            return False, f"goal cell ({col}, {row}) is lethal obstacle"
+        if cost_val < 0:
+            return True, f"unknown cell ({col}, {row})"
+        if cost_val == 0:
+            return True, f"free cell ({col}, {row})"
+        return True, f"passable cell ({col}, {row}) cost={cost_val}"
+
+    def webui_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            window = self._last_window
+            rx, ry, ryaw = self._last_robot_pose
+            last_pub = self._last_publish_wall
+            if window is None:
+                rx, ry, ryaw = (
+                    (self._latest_odom[0], self._latest_odom[1], self._latest_odom[3])
+                    if self._latest_odom is not None
+                    else (self.grid.robot_x, self.grid.robot_y, 0.0)
+                )
+                window = self.grid.window((rx, ry))
+            health = {
+                "ok": self._ros_started,
+                "frame": self.cfg.map_frame,
+                "semantics_enabled": self.segmenter.enabled,
+                "semantics_reason": self.segmenter.reason,
+                "counters": dict(self._counters),
+                "grid": self.grid.stats(),
+                "last_error": self._last_error,
+            }
+        points = window.obstacle_points
+        total_obstacles = int(points.shape[0])
+        if total_obstacles > MAX_WEBUI_OBSTACLES:
+            step = max(1, total_obstacles // MAX_WEBUI_OBSTACLES)
+            sampled = points[::step][:MAX_WEBUI_OBSTACLES]
+        else:
+            sampled = points
+        obstacles = [
+            [round(float(p[0]), 3), round(float(p[1]), 3), round(float(p[2]), 3)]
+            for p in sampled
+        ]
+        return {
+            "timestamp_wall": time.time(),
+            "last_publish_wall": last_pub,
+            "health": health,
+            "config": {
+                "map_frame": self.cfg.map_frame,
+                "base_frame": self.cfg.base_frame,
+                "grid_size_m": self.cfg.grid_size_m,
+                "publish_size_m": self.cfg.publish_size_m,
+                "resolution_m": self.cfg.resolution_m,
+                "update_rate_hz": self.cfg.update_rate_hz,
+                "publish_rate_hz": self.cfg.publish_rate_hz,
+                "decay_seconds": self.cfg.decay_seconds,
+                "observation_radius_m": self.cfg.observation_radius_m,
+                "stale_obstacle_cost": self.cfg.stale_obstacle_cost,
+                "wall_aversion_radius_m": self.cfg.wall_aversion_radius_m,
+                "wall_aversion_max_cost": self.cfg.wall_aversion_max_cost,
+                "sensor_roles": sorted(self.cfg.sensor_providers),
+            },
+            "robot": {
+                "x": round(float(rx), 3),
+                "y": round(float(ry), 3),
+                "yaw": round(float(ryaw), 4),
+            },
+            "window": {
+                "width": int(window.cost.shape[1]),
+                "height": int(window.cost.shape[0]),
+                "resolution": float(window.resolution),
+                "origin_x": float(window.origin_x),
+                "origin_y": float(window.origin_y),
+                "cost_b64": base64.b64encode(
+                    np.ascontiguousarray(window.cost, dtype=np.int8).tobytes()
+                ).decode("ascii"),
+                "occupancy_b64": base64.b64encode(
+                    np.ascontiguousarray(window.occupancy, dtype=np.int8).tobytes()
+                ).decode("ascii"),
+                "obstacle_count": total_obstacles,
+                "obstacles": obstacles,
+            },
+        }
+
+    def _publish_health(self) -> None:
+        from std_msgs.msg import String
+
+        self._publishers["health"].publish(String(data=json.dumps(self.health_payload())))

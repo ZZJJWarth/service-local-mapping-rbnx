@@ -282,6 +282,48 @@ properties:
     x-group: Occupancy
     description: Age after which occupied evidence decays toward free; 0 disables decay.
 
+  observation_radius_m:
+    type: number
+    minimum: 2
+    maximum: 64
+    default: 15
+    x-group: Occupancy
+    description: >-
+      Active observation radius around the robot in metres. Previously occupied
+      cells outside this radius (or occluded beyond decay_seconds without being
+      ray-cleared) are kept as stale obstacles when stale_obstacle_cost > 0.
+
+  stale_obstacle_cost:
+    type: integer
+    minimum: 0
+    maximum: 99
+    default: 0
+    x-group: Occupancy
+    description: >-
+      Cost assigned to remembered non-traversable cells that have left the
+      active observation radius or decayed without ray-clearing. Re-observing
+      them as free clears the stale state. 0 disables stale obstacle memory.
+
+  wall_aversion_radius_m:
+    type: number
+    minimum: 0
+    maximum: 5
+    default: 0
+    x-group: Occupancy
+    description: >-
+      Repulsion radius around lethal obstacles in metres to discourage
+      wall-hugging paths; 0 disables wall aversion.
+
+  wall_aversion_max_cost:
+    type: integer
+    minimum: 0
+    maximum: 95
+    default: 65
+    x-group: Occupancy
+    description: >-
+      Peak soft cost immediately adjacent to lethal obstacles when
+      wall_aversion_radius_m > 0. Must stay below lethal (100).
+
   semantic_model_path:
     type: string
     x-group: Semantics
@@ -377,5 +419,31 @@ properties:
     default: 1
     x-group: Outputs
     description: Health publication rate.
+
+  webui_enabled:
+    type: boolean
+    default: true
+    x-group: Web UI
+    description: Serve a read-only local map inspection page over HTTP.
+
+  webui_host:
+    type: string
+    default: 127.0.0.1
+    x-group: Web UI
+    description: Bind address for the read-only local map Web UI.
+
+  webui_port:
+    type: integer
+    minimum: 0
+    maximum: 65535
+    default: 8092
+    x-group: Web UI
+    description: Bind port for the read-only local map Web UI; 0 disables it.
+
+  visual_object_url:
+    type: string
+    default: http://127.0.0.1:8094
+    x-group: Web UI
+    description: Optional loopback API URL of service-visual-object-rbnx merged into the 8092 Web UI.
 
 required: [sensor_providers]

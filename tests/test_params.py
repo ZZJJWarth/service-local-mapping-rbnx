@@ -20,6 +20,17 @@ def test_defaults_are_valid():
     assert cfg.map_frame == "minecraft_odom"
     assert cfg.base_frame == "minecraft_view_base"
     assert not cfg.semantic_enabled
+    assert cfg.webui_enabled is True
+    assert cfg.webui_host == "127.0.0.1"
+    assert cfg.webui_port == 8092
+
+
+def test_webui_config_overrides():
+    cfg = make_cfg(webui_enabled=False, webui_host="127.0.0.1", webui_port=0)
+    assert cfg.webui_enabled is False
+    assert cfg.webui_port == 0
+    with pytest.raises(params.ConfigError, match="webui_port"):
+        make_cfg(webui_port=70000)
 
 
 def test_unknown_role_rejected():

@@ -59,6 +59,10 @@ TOP_LEVEL_KEYS = {
     "log_odds_min",
     "log_odds_max",
     "decay_seconds",
+    "observation_radius_m",
+    "stale_obstacle_cost",
+    "wall_aversion_radius_m",
+    "wall_aversion_max_cost",
     "semantic_model_path",
     "semantic_width",
     "semantic_height",
@@ -73,6 +77,10 @@ TOP_LEVEL_KEYS = {
     "health_topic",
     "health_rate_hz",
     "allowed_input_frames",
+    "webui_enabled",
+    "webui_host",
+    "webui_port",
+    "visual_object_url",
 }
 
 
@@ -111,6 +119,10 @@ class MapConfig:
     log_odds_min: float = -5.0
     log_odds_max: float = 5.0
     decay_seconds: float = 8.0
+    observation_radius_m: float = 15.0
+    stale_obstacle_cost: int = 0
+    wall_aversion_radius_m: float = 0.0
+    wall_aversion_max_cost: int = 65
     semantic_model_path: str = ""
     semantic_width: int = 320
     semantic_height: int = 192
@@ -125,6 +137,10 @@ class MapConfig:
     health_topic: str = "/robonix/local_mapping/health"
     health_rate_hz: float = 1.0
     allowed_frames: frozenset[str] = field(default_factory=frozenset)
+    webui_enabled: bool = True
+    webui_host: str = "127.0.0.1"
+    webui_port: int = 8092
+    visual_object_url: str = "http://127.0.0.1:8094"
 
     @property
     def cells(self) -> int:
@@ -325,6 +341,18 @@ def from_config(config: dict[str, Any], package_root: Path) -> MapConfig:
         log_odds_min=log_min,
         log_odds_max=log_max,
         decay_seconds=_number(config.get("decay_seconds", 8.0), "decay_seconds", 0, 120),
+        observation_radius_m=_number(
+            config.get("observation_radius_m", 15.0), "observation_radius_m", 2, 64
+        ),
+        stale_obstacle_cost=_integer(
+            config.get("stale_obstacle_cost", 0), "stale_obstacle_cost", 0, 99
+        ),
+        wall_aversion_radius_m=_number(
+            config.get("wall_aversion_radius_m", 0.0), "wall_aversion_radius_m", 0, 5
+        ),
+        wall_aversion_max_cost=_integer(
+            config.get("wall_aversion_max_cost", 65), "wall_aversion_max_cost", 0, 95
+        ),
         semantic_model_path=resolve_model_path(
             config.get("semantic_model_path", ""), package_root
         ),
@@ -359,6 +387,10 @@ def from_config(config: dict[str, Any], package_root: Path) -> MapConfig:
         ),
         health_rate_hz=_number(config.get("health_rate_hz", 1.0), "health_rate_hz", 0.1, 5),
         allowed_frames=frozenset(allowed_frames),
+        webui_enabled=_boolean(config.get("webui_enabled", True), "webui_enabled"),
+        webui_host=_string(config.get("webui_host", "127.0.0.1"), "webui_host"),
+        webui_port=_integer(config.get("webui_port", 8092), "webui_port", 0, 65535),
+        visual_object_url=str(config.get("visual_object_url", "http://127.0.0.1:8094") or "").strip(),
     )
 
 

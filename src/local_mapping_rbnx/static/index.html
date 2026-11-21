@@ -1,0 +1,1362 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Robonix Local Mapping Viewer</title>
+  <style>
+    :root {
+      --bg: #0f141c;
+      --panel: #161d27;
+      --border: #263244;
+      --text: #e6edf3;
+      --muted: #8b9bb4;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+      --accent: #38bdf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 16px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+    .title-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: 0.2px;
+    }
+    .badge {
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #1e293b;
+      color: var(--muted);
+    }
+    .badge.ok { color: #86efac; border-color: #166534; background: #052e16; }
+    .badge.warn { color: #fde68a; border-color: #92400e; background: #451a03; }
+    .badge.err { color: #fca5a5; border-color: #991b1b; background: #450a0a; }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 13px;
+    }
+    select, button {
+      background: #1e293b;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled), select:hover { border-color: var(--accent); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.primary {
+      background: #0369a1;
+      border-color: #0284c7;
+      color: #f0f9ff;
+      font-weight: 500;
+    }
+    button.primary.armed {
+      background: #15803d;
+      border-color: #22c55e;
+      box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.25);
+    }
+    button.danger {
+      background: #7f1d1d;
+      border-color: #b91c1c;
+      color: #fef2f2;
+    }
+    label.toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--muted);
+      cursor: pointer;
+      user-select: none;
+    }
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 400px;
+      min-height: 0;
+    }
+    .canvas-wrap {
+      position: relative;
+      background: #0b0f16;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+    }
+    canvas:active { cursor: grabbing; }
+    canvas.nav-armed { cursor: crosshair; }
+    .hud-top {
+      position: absolute;
+      left: 12px;
+      top: 12px;
+      display: none;
+      background: rgba(5, 46, 22, 0.92);
+      border: 1px solid #22c55e;
+      color: #bbf7d0;
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 13px;
+      pointer-events: none;
+    }
+    .hud-bottom {
+      position: absolute;
+      left: 12px;
+      bottom: 12px;
+      background: rgba(15, 20, 28, 0.88);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--text);
+      pointer-events: none;
+    }
+    aside {
+      background: var(--panel);
+      border-left: 1px solid var(--border);
+      padding: 12px 14px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .card {
+      background: #111822;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .card h2 {
+      margin: 0 0 8px 0;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .kv {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 4px 10px;
+      font-size: 13px;
+    }
+    .kv .k { color: var(--muted); }
+    .kv .v {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      text-align: right;
+    }
+    .nav-detail {
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--muted);
+      word-break: break-word;
+    }
+    .nav-feedback {
+      margin-top: 6px;
+      font-size: 12px;
+      padding: 5px 8px;
+      border-radius: 5px;
+      display: none;
+    }
+    .nav-feedback.ok { display: block; background: #052e16; border: 1px solid #166534; color: #86efac; }
+    .nav-feedback.err { display: block; background: #450a0a; border: 1px solid #991b1b; color: #fecaca; }
+    .legend {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+      border: 1px solid rgba(255,255,255,0.18);
+      flex-shrink: 0;
+    }
+    .error-box {
+      display: none;
+      background: #450a0a;
+      border: 1px solid #991b1b;
+      color: #fecaca;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 12px;
+      word-break: break-word;
+    }
+    .roles {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+    .role-chip {
+      font-size: 11px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: #1e293b;
+      color: #cbd5e1;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .tab-bar {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .tab-btn {
+      padding: 7px 10px;
+      border-radius: 7px;
+      font-weight: 600;
+      font-size: 12.5px;
+      background: #111822;
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+    .tab-btn.active {
+      background: #0369a1;
+      border-color: #38bdf8;
+      color: #f0f9ff;
+    }
+    .tab-pane { display: none; flex-direction: column; gap: 12px; }
+    .tab-pane.active { display: flex; }
+    .vo-preview-wrap {
+      background: #05080f;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      min-height: 170px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .vo-preview-wrap img { width: 100%; height: auto; display: block; }
+    .vo-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+    .vo-row input {
+      background: #0b0f16;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 12.5px;
+    }
+    .vo-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+    .vo-table th, .vo-table td { text-align: left; padding: 5px 6px; border-bottom: 1px solid #26324488; }
+    .vo-table th { color: var(--muted); font-weight: 600; }
+    .vo-table tr.selected { background: #0369a144; }
+    .vo-table tbody tr { cursor: pointer; }
+    .vo-toast {
+      margin-top: 8px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      background: #0b0f16;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      word-break: break-word;
+    }
+    .vo-toast.ok { border-color: #166534; background: #052e16; color: #86efac; }
+    .vo-toast.err { border-color: #991b1b; background: #450a0a; color: #fecaca; }
+    button.ok { background: #15803d; border-color: #22c55e; color: #f0fdf4; font-weight: 500; }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; grid-template-rows: 1fr 300px; }
+      aside { border-left: none; border-top: 1px solid var(--border); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title-group">
+      <h1>Local Mapping</h1>
+      <span id="statusBadge" class="badge">Connecting...</span>
+      <span id="semBadge" class="badge">Semantics: --</span>
+      <span id="frameBadge" class="badge">frame: --</span>
+    </div>
+    <div class="controls">
+      <button id="btnNavMode" class="primary" type="button">选点导航</button>
+      <button id="btnCancelNav" class="danger" type="button" disabled>取消导航</button>
+      <select id="layerSelect" title="Display layer">
+        <option value="cost">Cost Grid</option>
+        <option value="occupancy">Occupancy Grid</option>
+      </select>
+      <label class="toggle"><input id="chkObstacles" type="checkbox" checked />障碍点</label>
+      <label class="toggle"><input id="chkVisualObjs" type="checkbox" checked />视觉方块</label>
+      <label class="toggle"><input id="chkRings" type="checkbox" checked />距离环</label>
+      <label class="toggle"><input id="chkGrid" type="checkbox" checked />网格线</label>
+      <select id="rateSelect" title="Poll rate">
+        <option value="500">2 Hz</option>
+        <option value="200" selected>5 Hz</option>
+        <option value="100">10 Hz</option>
+      </select>
+      <button id="btnPause" type="button">暂停</button>
+      <button id="btnResetView" type="button">重置视图</button>
+      <button id="btnResetMap" class="danger" type="button">重置地图</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="canvas-wrap">
+      <canvas id="mapCanvas"></canvas>
+      <div id="navHint" class="hud-top">选点导航已开启：点击地图任意非障碍点前往（按住拖拽可指定朝向，按 Esc 取消）</div>
+      <div id="hoverHud" class="hud-bottom">移动鼠标查看栅格坐标与代价值 · 滚轮缩放 · 拖拽平移</div>
+    </div>
+    <aside>
+      <div class="tab-bar">
+        <button id="tabBtnMap" class="tab-btn active" type="button">🗺️ 建图与导航</button>
+        <button id="tabBtnVo" class="tab-btn" type="button">📦 视觉方块与箱子 <span id="tabVoCount"></span></button>
+      </div>
+
+      <div id="paneMap" class="tab-pane active">
+      <div id="errorBox" class="error-box"></div>
+
+      <div class="card">
+        <h2>
+          <span>Navigation Goal</span>
+          <span id="navStateBadge" class="badge">IDLE</span>
+        </h2>
+        <div class="kv">
+          <span class="k">Goal (x, y)</span><span id="vGoalXY" class="v">--</span>
+          <span class="k">Goal Yaw</span><span id="vGoalYaw" class="v">--</span>
+          <span class="k">Dist to Goal</span><span id="vGoalDist" class="v">--</span>
+        </div>
+        <div id="vNavDetail" class="nav-detail">点击顶部「选点导航」后在地图上选点</div>
+        <div id="navFeedback" class="nav-feedback"></div>
+      </div>
+
+      <div class="card">
+        <h2>Robot &amp; Window</h2>
+        <div class="kv">
+          <span class="k">Robot X / Y</span><span id="vRobotXY" class="v">--</span>
+          <span class="k">Heading (yaw)</span><span id="vRobotYaw" class="v">--</span>
+          <span class="k">Window</span><span id="vWindow" class="v">--</span>
+          <span class="k">Origin (x, y)</span><span id="vOrigin" class="v">--</span>
+          <span class="k">Last Update</span><span id="vAge" class="v">--</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Grid Stats</h2>
+        <div class="kv">
+          <span class="k">Occupied Cells</span><span id="vOccCells" class="v">--</span>
+          <span class="k">Stale Obstacles</span><span id="vStaleCells" class="v">--</span>
+          <span class="k">Free Cells</span><span id="vFreeCells" class="v">--</span>
+          <span class="k">Semantic Cells</span><span id="vSemCells" class="v">--</span>
+          <span class="k">Obstacle Points</span><span id="vObsCount" class="v">--</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Pipeline Counters</h2>
+        <div class="kv">
+          <span class="k">Total Frames</span><span id="cFrames" class="v">--</span>
+          <span class="k">LiDAR Hits</span><span id="cLidar" class="v">--</span>
+          <span class="k">Depth Hits</span><span id="cDepth" class="v">--</span>
+          <span class="k">Dropped (TF)</span><span id="cDropTf" class="v">--</span>
+          <span class="k">Dropped (Frame)</span><span id="cDropFrame" class="v">--</span>
+          <span class="k">Invalid Frames</span><span id="cInvalid" class="v">--</span>
+          <span class="k">Semantic Frames</span><span id="cSemFrames" class="v">--</span>
+          <span class="k">Semantic Skipped</span><span id="cSemSkip" class="v">--</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Legend</h2>
+        <div class="legend">
+          <div class="legend-item"><span class="swatch" style="background:#1e2430"></span>Unknown (-1)</div>
+          <div class="legend-item"><span class="swatch" style="background:#263844"></span>Free (0)</div>
+          <div class="legend-item"><span class="swatch" style="background:#eab308"></span>Wall Aversion (1–65)</div>
+          <div class="legend-item"><span class="swatch" style="background:#a855f7"></span>Stale Obstacle (82)</div>
+          <div class="legend-item"><span class="swatch" style="background:#ef4444"></span>Lethal (100)</div>
+          <div class="legend-item"><span class="swatch" style="background:#22c55e"></span>Nav Goal</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Sensor Roles</h2>
+        <div id="rolesBox" class="roles"></div>
+      </div>
+      </div>
+
+      <div id="paneVo" class="tab-pane">
+        <div class="card">
+          <h2>
+            <span>实时 RGB-D 方块识别</span>
+            <span id="voStatusBadge" class="badge">Connecting...</span>
+          </h2>
+          <div class="vo-preview-wrap">
+            <img id="voPreviewImg" alt="等待机器人 RGB 相机画面..." />
+          </div>
+          <div class="nav-detail" id="voMetaLine">绿框=通过3D物理尺寸校验 · 黄框=2D候选</div>
+          <div class="vo-row">
+            <select id="voScanLabel" style="flex:1">
+              <option value="chest">箱子 (chest)</option>
+            </select>
+            <label class="toggle"><input id="voChkSweep" type="checkbox" checked />360°扫视</label>
+          </div>
+          <div class="vo-row">
+            <button id="voBtnScan" class="primary" type="button" style="flex:1">🔍 扫描方块</button>
+            <button id="voBtnClear" class="danger" type="button">清空</button>
+          </div>
+          <div id="voToast" class="vo-toast">就绪：点击「扫描方块」发现当前房间内的箱子，或在地图上点击 📦 标记选中。</div>
+        </div>
+
+        <div class="card">
+          <h2>
+            <span>已确认 3D 目标</span>
+            <span id="voObjCountBadge" class="badge">0</span>
+          </h2>
+          <table class="vo-table">
+            <thead>
+              <tr><th>ID</th><th>距离</th><th>尺寸(m)</th><th>置信</th><th>操作</th></tr>
+            </thead>
+            <tbody id="voObjBody">
+              <tr><td colspan="5" style="color:var(--muted)">暂无已确认目标</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>
+            <span>箱子交互</span>
+            <span id="voSelLabel" class="badge">自动选最近</span>
+          </h2>
+          <div class="vo-row" style="margin-top:0">
+            <button id="voBtnApproach" type="button" style="flex:1">🚶 走近箱子</button>
+            <button id="voBtnInspect" class="primary" type="button" style="flex:1">🔓 开箱检查</button>
+          </div>
+          <div class="vo-row">
+            <input id="voItemInput" type="text" value="minecraft:bread" placeholder="物品ID (如 minecraft:bread)" style="flex:1;min-width:130px" />
+            <input id="voCountInput" type="number" value="1" min="1" max="64" style="width:58px" />
+          </div>
+          <div class="vo-row">
+            <button id="voBtnWithdraw" class="ok" type="button" style="flex:1">⬇ 从箱子取出</button>
+            <button id="voBtnDeposit" class="primary" type="button" style="flex:1">⬆ 放入箱子</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>最近一次开箱物品清单</h2>
+          <table class="vo-table">
+            <thead>
+              <tr><th>槽位</th><th>物品 ID</th><th>数量</th></tr>
+            </thead>
+            <tbody id="voChestItemsBody">
+              <tr><td colspan="3" style="color:var(--muted)">点击「开箱检查」查看箱内物品</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script>
+    const canvas = document.getElementById('mapCanvas');
+    const ctx = canvas.getContext('2d');
+    const hoverHud = document.getElementById('hoverHud');
+    const navHint = document.getElementById('navHint');
+    const navFeedback = document.getElementById('navFeedback');
+    const btnNavMode = document.getElementById('btnNavMode');
+    const btnCancelNav = document.getElementById('btnCancelNav');
+    const layerSelect = document.getElementById('layerSelect');
+    const chkObstacles = document.getElementById('chkObstacles');
+    const chkVisualObjs = document.getElementById('chkVisualObjs');
+    const chkRings = document.getElementById('chkRings');
+    const chkGrid = document.getElementById('chkGrid');
+    const rateSelect = document.getElementById('rateSelect');
+    const btnPause = document.getElementById('btnPause');
+    const btnResetView = document.getElementById('btnResetView');
+    const btnResetMap = document.getElementById('btnResetMap');
+
+    const offscreen = document.createElement('canvas');
+    const offCtx = offscreen.getContext('2d');
+
+    const NAV_TERMINAL = new Set(['IDLE', 'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED']);
+
+    let latest = null;
+    let decodedCost = null;
+    let decodedOcc = null;
+    let paused = false;
+    let zoom = 1.0;
+    let panX = 0;
+    let panY = 0;
+    let dragging = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let mousePos = null;
+    let pollTimer = null;
+    let inFlight = false;
+
+    let navArmed = false;
+    let goalDraft = null; // { wx, wy, sx, sy, yaw }
+    let activeTab = 'map';
+    let voObjects = [];
+    let voSelectedId = '';
+
+    function setNavArmed(armed) {
+      navArmed = armed;
+      goalDraft = null;
+      btnNavMode.classList.toggle('armed', armed);
+      btnNavMode.textContent = armed ? '选点中 (Esc取消)' : '选点导航';
+      canvas.classList.toggle('nav-armed', armed);
+      navHint.style.display = armed ? 'block' : 'none';
+      render();
+    }
+
+    function showFeedback(ok, text) {
+      navFeedback.className = `nav-feedback ${ok ? 'ok' : 'err'}`;
+      navFeedback.textContent = text;
+    }
+
+    function decodeInt8Base64(b64) {
+      const bin = atob(b64);
+      const out = new Int8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) {
+        const v = bin.charCodeAt(i);
+        out[i] = v > 127 ? v - 256 : v;
+      }
+      return out;
+    }
+
+    function cellRGBA(val, isCost, staleCost) {
+      if (val < 0) return [30, 36, 48, 255];
+      if (val === 0) return [38, 56, 68, 255];
+      if (val >= 100) return [239, 68, 68, 255];
+      if (!isCost) return [249, 115, 22, 255];
+      if (staleCost > 0 && val === staleCost) return [168, 85, 247, 255];
+      if (val >= 85) return [249, 115, 22, 255];
+      if (val >= 40) return [234, 179, 8, 255];
+      const t = val / 40.0;
+      return [
+        Math.round(38 + t * (234 - 38)),
+        Math.round(56 + t * (179 - 56)),
+        Math.round(68 + t * (8 - 68)),
+        255,
+      ];
+    }
+
+    function resizeCanvas() {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      render();
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    function viewTransform(win) {
+      const cw = canvas.width;
+      const ch = canvas.height;
+      const pad = 32 * (window.devicePixelRatio || 1);
+      const baseScale = Math.min(cw - pad * 2, ch - pad * 2) / Math.max(1, win.width);
+      const pxPerCell = baseScale * zoom;
+      const drawW = win.width * pxPerCell;
+      const drawH = win.height * pxPerCell;
+      const left = (cw - drawW) / 2 + panX;
+      const top = (ch - drawH) / 2 + panY;
+      return { left, top, drawW, drawH, pxPerCell };
+    }
+
+    function worldToScreen(wx, wy, win, vt) {
+      const col = (wx - win.origin_x) / win.resolution;
+      const row = (wy - win.origin_y) / win.resolution;
+      const sx = vt.left + col * vt.pxPerCell;
+      const sy = vt.top + (win.height - row) * vt.pxPerCell;
+      return [sx, sy];
+    }
+
+    function screenToWorld(sx, sy, win, vt) {
+      const colF = (sx - vt.left) / vt.pxPerCell;
+      const rowF = win.height - (sy - vt.top) / vt.pxPerCell;
+      const wx = win.origin_x + colF * win.resolution;
+      const wy = win.origin_y + rowF * win.resolution;
+      const col = Math.floor(colF);
+      const row = Math.floor(rowF);
+      const inBounds = col >= 0 && col < win.width && row >= 0 && row < win.height;
+      return { col, row, wx, wy, inBounds };
+    }
+
+    function drawGoalMarker(gx, gy, gyaw, color, label, win, vt) {
+      const dpr = window.devicePixelRatio || 1;
+      const [sx, sy] = worldToScreen(gx, gy, win, vt);
+      const r = 9 * dpr;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 2.2 * dpr;
+      ctx.beginPath();
+      ctx.arc(sx, sy, r, 0, Math.PI * 2);
+      ctx.stroke();
+
+      if (typeof gyaw === 'number' && Number.isFinite(gyaw)) {
+        const len = 22 * dpr;
+        const ex = sx + Math.cos(gyaw) * len;
+        const ey = sy - Math.sin(gyaw) * len;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+
+        const head = 6 * dpr;
+        const ang = Math.atan2(ey - sy, ex - sx);
+        ctx.beginPath();
+        ctx.moveTo(ex, ey);
+        ctx.lineTo(ex - head * Math.cos(ang - 0.5), ey - head * Math.sin(ang - 0.5));
+        ctx.lineTo(ex - head * Math.cos(ang + 0.5), ey - head * Math.sin(ang + 0.5));
+        ctx.closePath();
+        ctx.fill();
+      }
+      if (label) {
+        ctx.font = `${Math.round(11 * dpr)}px monospace`;
+        ctx.fillText(label, sx + r + 5 * dpr, sy - r);
+      }
+      ctx.restore();
+    }
+
+    function render() {
+      ctx.fillStyle = '#0b0f16';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      if (!latest || !latest.window || !decodedCost) return;
+
+      const win = latest.window;
+      const isCost = layerSelect.value === 'cost';
+      const grid = isCost ? decodedCost : decodedOcc;
+
+      if (offscreen.width !== win.width || offscreen.height !== win.height) {
+        offscreen.width = win.width;
+        offscreen.height = win.height;
+      }
+      const img = offCtx.createImageData(win.width, win.height);
+      const data = img.data;
+      const staleCost = (latest.config && latest.config.stale_obstacle_cost) || 0;
+      for (let r = 0; r < win.height; r++) {
+        const dstRow = win.height - 1 - r;
+        for (let c = 0; c < win.width; c++) {
+          const val = grid[r * win.width + c];
+          const rgba = cellRGBA(val, isCost, staleCost);
+          const idx = (dstRow * win.width + c) * 4;
+          data[idx] = rgba[0];
+          data[idx + 1] = rgba[1];
+          data[idx + 2] = rgba[2];
+          data[idx + 3] = rgba[3];
+        }
+      }
+      offCtx.putImageData(img, 0, 0);
+
+      const vt = viewTransform(win);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(offscreen, vt.left, vt.top, vt.drawW, vt.drawH);
+
+      ctx.strokeStyle = '#334155';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(vt.left, vt.top, vt.drawW, vt.drawH);
+
+      if (chkGrid.checked) {
+        const stepM = 4.0;
+        const xStart = Math.ceil(win.origin_x / stepM) * stepM;
+        const xEnd = win.origin_x + win.width * win.resolution;
+        const yStart = Math.ceil(win.origin_y / stepM) * stepM;
+        const yEnd = win.origin_y + win.height * win.resolution;
+        ctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let x = xStart; x <= xEnd; x += stepM) {
+          const [sx] = worldToScreen(x, win.origin_y, win, vt);
+          ctx.moveTo(sx, vt.top);
+          ctx.lineTo(sx, vt.top + vt.drawH);
+        }
+        for (let y = yStart; y <= yEnd; y += stepM) {
+          const [, sy] = worldToScreen(win.origin_x, y, win, vt);
+          ctx.moveTo(vt.left, sy);
+          ctx.lineTo(vt.left + vt.drawW, sy);
+        }
+        ctx.stroke();
+      }
+
+      const robot = latest.robot || { x: 0, y: 0, yaw: 0 };
+      const [rx, ry] = worldToScreen(robot.x, robot.y, win, vt);
+      if (chkRings.checked) {
+        const pxPerM = vt.pxPerCell / win.resolution;
+        const obsR = (latest.config && latest.config.observation_radius_m) || 15;
+        const maxR = (win.width * win.resolution) / 2.0;
+        const rings = maxR >= 25 ? [obsR, 30] : [5, 10, obsR];
+        ctx.font = `${Math.round(11 * (window.devicePixelRatio || 1))}px monospace`;
+        ctx.lineWidth = 1.2;
+        for (const rM of rings) {
+          if (rM > maxR + 0.5) continue;
+          const rPx = rM * pxPerM;
+          ctx.save();
+          if (Math.abs(rM - obsR) < 0.1) {
+            ctx.setLineDash([6, 4]);
+            ctx.strokeStyle = 'rgba(56, 189, 248, 0.65)';
+            ctx.fillStyle = 'rgba(56, 189, 248, 0.9)';
+          } else {
+            ctx.strokeStyle = 'rgba(148, 163, 184, 0.28)';
+            ctx.fillStyle = 'rgba(148, 163, 184, 0.75)';
+          }
+          ctx.beginPath();
+          ctx.arc(rx, ry, rPx, 0, Math.PI * 2);
+          ctx.stroke();
+          const tag = Math.abs(rM - obsR) < 0.1 ? `${rM}m obs` : `${rM}m`;
+          ctx.fillText(tag, rx + rPx + 4, ry - 4);
+          ctx.restore();
+        }
+      }
+
+      if (chkObstacles.checked && Array.isArray(win.obstacles)) {
+        ctx.fillStyle = 'rgba(224, 242, 254, 0.85)';
+        const dot = Math.max(2, vt.pxPerCell * 0.45);
+        for (const pt of win.obstacles) {
+          const [px, py] = worldToScreen(pt[0], pt[1], win, vt);
+          ctx.fillRect(px - dot / 2, py - dot / 2, dot, dot);
+        }
+      }
+
+      // Visually detected 3D blocks (e.g. chests) overlaid on local map
+      if (chkVisualObjs.checked && Array.isArray(voObjects) && voObjects.length) {
+        const dpr = window.devicePixelRatio || 1;
+        const boxSz = Math.max(9 * dpr, (0.9 / win.resolution) * vt.pxPerCell);
+        ctx.save();
+        ctx.font = `600 ${Math.round(11 * dpr)}px ui-monospace, monospace`;
+        for (const obj of voObjects) {
+          const [ox, oy] = worldToScreen(obj.odom_x, obj.odom_y, win, vt);
+          const isSel = obj.visual_id === voSelectedId;
+          const isVis = obj.status !== 'remembered';
+          ctx.save();
+          if (!isVis && !isSel) ctx.setLineDash([4 * dpr, 3 * dpr]);
+          ctx.fillStyle = isSel
+            ? 'rgba(56, 189, 248, 0.35)'
+            : (isVis ? 'rgba(245, 158, 11, 0.35)' : 'rgba(245, 158, 11, 0.16)');
+          ctx.strokeStyle = isSel ? '#38bdf8' : (isVis ? '#f59e0b' : 'rgba(245, 158, 11, 0.65)');
+          ctx.lineWidth = (isSel ? 2.6 : 1.8) * dpr;
+          ctx.fillRect(ox - boxSz / 2, oy - boxSz / 2, boxSz, boxSz);
+          ctx.strokeRect(ox - boxSz / 2, oy - boxSz / 2, boxSz, boxSz);
+          ctx.fillStyle = isSel ? '#7dd3fc' : (isVis ? '#fde68a' : '#cbd5e1');
+          ctx.fillText(`📦 ${obj.visual_id}${isVis ? '' : ' (记忆)'}`, ox + boxSz / 2 + 4 * dpr, oy + 4 * dpr);
+          ctx.restore();
+        }
+        ctx.restore();
+      }
+
+      // Active / last navigation goal
+      const nav = latest.navigation;
+      if (nav && typeof nav.goal_x === 'number' && typeof nav.goal_y === 'number') {
+        const [gx, gy] = worldToScreen(nav.goal_x, nav.goal_y, win, vt);
+        const active = !NAV_TERMINAL.has(nav.state || 'IDLE');
+        ctx.save();
+        ctx.setLineDash([6, 5]);
+        ctx.strokeStyle = active ? 'rgba(34, 197, 94, 0.7)' : 'rgba(148, 163, 184, 0.4)';
+        ctx.lineWidth = 1.5 * (window.devicePixelRatio || 1);
+        ctx.beginPath();
+        ctx.moveTo(rx, ry);
+        ctx.lineTo(gx, gy);
+        ctx.stroke();
+        ctx.restore();
+        drawGoalMarker(
+          nav.goal_x,
+          nav.goal_y,
+          nav.goal_yaw,
+          active ? '#22c55e' : '#94a3b8',
+          active ? 'GOAL' : (nav.state || ''),
+          win,
+          vt
+        );
+      }
+
+      // Goal draft preview while dragging
+      if (goalDraft) {
+        drawGoalMarker(goalDraft.wx, goalDraft.wy, goalDraft.yaw, '#facc15', 'SET GOAL', win, vt);
+      }
+
+      // Robot marker + heading arrow
+      const dpr = window.devicePixelRatio || 1;
+      const rad = Math.max(6 * dpr, (0.45 / win.resolution) * vt.pxPerCell);
+      ctx.save();
+      ctx.translate(rx, ry);
+      ctx.rotate(-robot.yaw);
+      ctx.fillStyle = '#38bdf8';
+      ctx.strokeStyle = '#0f172a';
+      ctx.lineWidth = 2 * dpr;
+      ctx.beginPath();
+      ctx.moveTo(rad * 1.35, 0);
+      ctx.lineTo(-rad * 0.85, -rad * 0.8);
+      ctx.lineTo(-rad * 0.45, 0);
+      ctx.lineTo(-rad * 0.85, rad * 0.8);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+
+      updateHoverHud(win, vt);
+    }
+
+    function updateHoverHud(win, vt) {
+      if (!mousePos) return;
+      const hit = screenToWorld(mousePos.x, mousePos.y, win, vt);
+      if (!hit.inBounds) {
+        hoverHud.textContent = '鼠标在窗口外 · 滚轮缩放 · 拖拽平移';
+        return;
+      }
+      const idx = hit.row * win.width + hit.col;
+      const cVal = decodedCost ? decodedCost[idx] : '--';
+      const oVal = decodedOcc ? decodedOcc[idx] : '--';
+      const robot = latest.robot || { x: 0, y: 0 };
+      const dist = Math.hypot(hit.wx - robot.x, hit.wy - robot.y);
+      hoverHud.textContent =
+        `odom=(${hit.wx.toFixed(2)}, ${hit.wy.toFixed(2)}) m  ` +
+        `cell=(${hit.col}, ${hit.row})  cost=${cVal}  occ=${oVal}  dist=${dist.toFixed(2)} m`;
+    }
+
+    function updateSidebar(data) {
+      const h = data.health || {};
+      const c = h.counters || {};
+      const g = h.grid || {};
+      const cfg = data.config || {};
+      const r = data.robot || { x: 0, y: 0, yaw: 0 };
+      const w = data.window || {};
+      const nav = data.navigation || { state: 'IDLE', detail: '' };
+
+      const statusBadge = document.getElementById('statusBadge');
+      if (h.ok) {
+        statusBadge.textContent = 'ROS Active';
+        statusBadge.className = 'badge ok';
+      } else {
+        statusBadge.textContent = 'Idle / Not Started';
+        statusBadge.className = 'badge warn';
+      }
+
+      const semBadge = document.getElementById('semBadge');
+      if (h.semantics_enabled) {
+        semBadge.textContent = 'Semantics: ON';
+        semBadge.className = 'badge ok';
+      } else {
+        semBadge.textContent = `Geometry-only (${h.semantics_reason || 'off'})`;
+        semBadge.className = 'badge';
+      }
+      document.getElementById('frameBadge').textContent = `frame: ${h.frame || '--'}`;
+
+      const errBox = document.getElementById('errorBox');
+      if (h.last_error) {
+        errBox.style.display = 'block';
+        errBox.textContent = `last_error: ${h.last_error}`;
+      } else {
+        errBox.style.display = 'none';
+      }
+
+      const navState = String(nav.state || 'IDLE').toUpperCase();
+      const navBadge = document.getElementById('navStateBadge');
+      navBadge.textContent = navState;
+      if (navState === 'RUNNING' || navState === 'PENDING') {
+        navBadge.className = 'badge warn';
+      } else if (navState === 'SUCCEEDED') {
+        navBadge.className = 'badge ok';
+      } else if (navState === 'FAILED') {
+        navBadge.className = 'badge err';
+      } else {
+        navBadge.className = 'badge';
+      }
+      const navActive = !NAV_TERMINAL.has(navState);
+      btnCancelNav.disabled = !navActive;
+
+      if (typeof nav.goal_x === 'number' && typeof nav.goal_y === 'number') {
+        document.getElementById('vGoalXY').textContent = `${nav.goal_x.toFixed(2)}, ${nav.goal_y.toFixed(2)} m`;
+        document.getElementById('vGoalYaw').textContent =
+          typeof nav.goal_yaw === 'number' ? `${(nav.goal_yaw * 180 / Math.PI).toFixed(1)}°` : '--';
+        const dGoal = Math.hypot(nav.goal_x - r.x, nav.goal_y - r.y);
+        document.getElementById('vGoalDist').textContent = `${dGoal.toFixed(2)} m`;
+      } else {
+        document.getElementById('vGoalXY').textContent = '--';
+        document.getElementById('vGoalYaw').textContent = '--';
+        document.getElementById('vGoalDist').textContent = '--';
+      }
+      if (nav.detail) {
+        document.getElementById('vNavDetail').textContent = nav.detail;
+      }
+
+      document.getElementById('vRobotXY').textContent = `${r.x.toFixed(2)}, ${r.y.toFixed(2)} m`;
+      document.getElementById('vRobotYaw').textContent = `${(r.yaw * 180 / Math.PI).toFixed(1)}°`;
+      document.getElementById('vWindow').textContent =
+        `${w.width || 0}×${w.height || 0} (${cfg.publish_size_m || 0}m @ ${w.resolution || 0}m)`;
+      document.getElementById('vOrigin').textContent =
+        `${(w.origin_x || 0).toFixed(2)}, ${(w.origin_y || 0).toFixed(2)}`;
+      const age = data.last_publish_wall
+        ? `${Math.max(0, data.timestamp_wall - data.last_publish_wall).toFixed(2)} s ago`
+        : 'no ROS publish yet';
+      document.getElementById('vAge').textContent = age;
+
+      document.getElementById('vOccCells').textContent = g.occupied_cells ?? '--';
+      document.getElementById('vStaleCells').textContent = g.stale_obstacle_cells ?? '--';
+      document.getElementById('vFreeCells').textContent = g.free_cells ?? '--';
+      document.getElementById('vSemCells').textContent = g.semantic_cells ?? '--';
+      document.getElementById('vObsCount').textContent = w.obstacle_count ?? '--';
+
+      document.getElementById('cFrames').textContent = c.frames ?? 0;
+      document.getElementById('cLidar').textContent = c.lidar_hits ?? 0;
+      document.getElementById('cDepth').textContent = c.depth_hits ?? 0;
+      document.getElementById('cDropTf').textContent = c.frames_dropped_tf ?? 0;
+      document.getElementById('cDropFrame').textContent = c.frames_dropped_frame ?? 0;
+      document.getElementById('cInvalid').textContent = c.frames_invalid ?? 0;
+      document.getElementById('cSemFrames').textContent = c.semantic_frames ?? 0;
+      document.getElementById('cSemSkip').textContent = c.semantic_skipped ?? 0;
+
+      const rolesBox = document.getElementById('rolesBox');
+      rolesBox.innerHTML = '';
+      for (const role of (cfg.sensor_roles || [])) {
+        const chip = document.createElement('span');
+        chip.className = 'role-chip';
+        chip.textContent = role;
+        rolesBox.appendChild(chip);
+      }
+    }
+
+    async function sendGoal(x, y, yaw) {
+      try {
+        const body = { x, y };
+        if (typeof yaw === 'number' && Number.isFinite(yaw)) body.yaw = yaw;
+        const resp = await fetch('/api/navigate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (resp.ok && data.ok) {
+          showFeedback(true, `已发送目标 (${x.toFixed(2)}, ${y.toFixed(2)})`);
+        } else {
+          showFeedback(false, `目标被拒绝: ${data.detail || `HTTP ${resp.status}`}`);
+        }
+        await poll();
+      } catch (err) {
+        showFeedback(false, `发送失败: ${err.message}`);
+      }
+    }
+
+    async function cancelGoal() {
+      try {
+        const resp = await fetch('/api/navigate/cancel', { method: 'POST' });
+        const data = await resp.json();
+        if (resp.ok && data.ok) {
+          showFeedback(true, `已取消导航: ${data.detail || 'canceled'}`);
+        } else {
+          showFeedback(false, `取消失败: ${data.detail || `HTTP ${resp.status}`}`);
+        }
+        await poll();
+      } catch (err) {
+        showFeedback(false, `取消失败: ${err.message}`);
+      }
+    }
+
+    async function resetMap() {
+      try {
+        const resp = await fetch('/api/map/reset', { method: 'POST' });
+        const data = await resp.json();
+        if (resp.ok && data.ok) {
+          showFeedback(true, '已重置局部地图');
+        } else {
+          showFeedback(false, `重置失败: ${data.detail || `HTTP ${resp.status}`}`);
+        }
+        await poll();
+      } catch (err) {
+        showFeedback(false, `重置失败: ${err.message}`);
+      }
+    }
+
+    async function poll() {
+      if (paused || inFlight) return;
+      inFlight = true;
+      try {
+        const resp = await fetch('/api/state', { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        latest = data;
+        if (data.window && data.window.cost_b64) {
+          decodedCost = decodeInt8Base64(data.window.cost_b64);
+          decodedOcc = decodeInt8Base64(data.window.occupancy_b64);
+        }
+        updateSidebar(data);
+        render();
+      } catch (err) {
+        const statusBadge = document.getElementById('statusBadge');
+        statusBadge.textContent = `Disconnected (${err.message})`;
+        statusBadge.className = 'badge err';
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    function restartPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(poll, Number(rateSelect.value));
+    }
+
+    function eventCanvasPos(e) {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      return {
+        x: (e.clientX - rect.left) * dpr,
+        y: (e.clientY - rect.top) * dpr,
+      };
+    }
+
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      zoom = Math.max(0.4, Math.min(8.0, zoom * factor));
+      render();
+    }, { passive: false });
+
+    canvas.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      if (navArmed && latest && latest.window) {
+        const pos = eventCanvasPos(e);
+        const vt = viewTransform(latest.window);
+        const hit = screenToWorld(pos.x, pos.y, latest.window, vt);
+        if (!hit.inBounds) {
+          showFeedback(false, '请点击局部地图窗口内的位置');
+          return;
+        }
+        const robot = latest.robot || { x: 0, y: 0, yaw: 0 };
+        const defaultYaw = Math.atan2(hit.wy - robot.y, hit.wx - robot.x);
+        goalDraft = { wx: hit.wx, wy: hit.wy, sx: pos.x, sy: pos.y, yaw: defaultYaw, customYaw: false };
+        render();
+        return;
+      }
+      if (!navArmed && chkVisualObjs.checked && latest && latest.window && voObjects.length) {
+        const pos = eventCanvasPos(e);
+        const vt = viewTransform(latest.window);
+        const dpr = window.devicePixelRatio || 1;
+        for (const obj of voObjects) {
+          const [ox, oy] = worldToScreen(obj.odom_x, obj.odom_y, latest.window, vt);
+          if (Math.hypot(pos.x - ox, pos.y - oy) <= 14 * dpr) {
+            selectVoObj(obj.visual_id);
+            switchTab('vo');
+            return;
+          }
+        }
+      }
+      dragging = true;
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+    });
+
+    window.addEventListener('mouseup', (e) => {
+      if (goalDraft) {
+        const draft = goalDraft;
+        setNavArmed(false);
+        sendGoal(draft.wx, draft.wy, draft.customYaw ? draft.yaw : null);
+        return;
+      }
+      dragging = false;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      const pos = eventCanvasPos(e);
+      mousePos = pos;
+      if (goalDraft) {
+        const dx = pos.x - goalDraft.sx;
+        const dy = -(pos.y - goalDraft.sy);
+        if (Math.hypot(dx, dy) > 8 * (window.devicePixelRatio || 1)) {
+          goalDraft.yaw = Math.atan2(dy, dx);
+          goalDraft.customYaw = true;
+        }
+        render();
+        return;
+      }
+      if (dragging) {
+        const dpr = window.devicePixelRatio || 1;
+        panX += (e.clientX - dragStartX) * dpr;
+        panY += (e.clientY - dragStartY) * dpr;
+        dragStartX = e.clientX;
+        dragStartY = e.clientY;
+        render();
+      } else if (latest && latest.window) {
+        updateHoverHud(latest.window, viewTransform(latest.window));
+      }
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && navArmed) {
+        setNavArmed(false);
+      }
+    });
+
+    btnNavMode.addEventListener('click', () => setNavArmed(!navArmed));
+    btnCancelNav.addEventListener('click', cancelGoal);
+    layerSelect.addEventListener('change', render);
+    chkObstacles.addEventListener('change', render);
+    chkVisualObjs.addEventListener('change', render);
+    chkRings.addEventListener('change', render);
+    chkGrid.addEventListener('change', render);
+    rateSelect.addEventListener('change', restartPolling);
+    btnPause.addEventListener('click', () => {
+      paused = !paused;
+      btnPause.textContent = paused ? '继续' : '暂停';
+      if (!paused) poll();
+    });
+    btnResetView.addEventListener('click', () => {
+      zoom = 1.0;
+      panX = 0;
+      panY = 0;
+      render();
+    });
+    btnResetMap.addEventListener('click', resetMap);
+
+    // ── Merged Visual Object & Container Panel (formerly 8094) ───────────────
+    const tabBtnMap = document.getElementById('tabBtnMap');
+    const tabBtnVo = document.getElementById('tabBtnVo');
+    const paneMap = document.getElementById('paneMap');
+    const paneVo = document.getElementById('paneVo');
+    const voToast = document.getElementById('voToast');
+
+    function switchTab(tab) {
+      activeTab = tab === 'vo' ? 'vo' : 'map';
+      tabBtnMap.classList.toggle('active', activeTab === 'map');
+      tabBtnVo.classList.toggle('active', activeTab === 'vo');
+      paneMap.classList.toggle('active', activeTab === 'map');
+      paneVo.classList.toggle('active', activeTab === 'vo');
+      if (activeTab === 'vo') {
+        pollVisualObject();
+        refreshVoPreview();
+      }
+    }
+    tabBtnMap.addEventListener('click', () => switchTab('map'));
+    tabBtnVo.addEventListener('click', () => switchTab('vo'));
+
+    function showVoToast(ok, msg) {
+      voToast.className = 'vo-toast ' + (ok ? 'ok' : 'err');
+      voToast.textContent = msg;
+    }
+
+    async function postVoJson(action, body) {
+      const resp = await fetch(`/api/visual_object/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}),
+      });
+      const data = await resp.json();
+      return { ok: resp.ok && Boolean(data.ok), data };
+    }
+
+    function renderVoChestItems(items) {
+      const tb = document.getElementById('voChestItemsBody');
+      const nonEmpty = (items || []).filter(it => it.count > 0 && it.item !== 'minecraft:air');
+      if (!nonEmpty.length) {
+        tb.innerHTML = '<tr><td colspan="3" style="color:var(--muted)">箱子为空</td></tr>';
+        return;
+      }
+      tb.innerHTML = nonEmpty.map(it =>
+        `<tr><td>#${it.slot}</td><td>${it.item}</td><td><strong>${it.count}</strong></td></tr>`
+      ).join('');
+    }
+
+    function selectVoObj(id) {
+      voSelectedId = id || '';
+      document.getElementById('voSelLabel').textContent = voSelectedId || '自动选最近';
+      render();
+      pollVisualObject();
+    }
+    window.selectVoObj = selectVoObj;
+
+    window.quickVoInspect = async (id) => {
+      selectVoObj(id);
+      showVoToast(true, `正在走近并打开 ${id}...`);
+      try {
+        const res = await postVoJson('inspect', { visual_id: id });
+        showVoToast(res.ok, res.data.detail || JSON.stringify(res.data));
+        if (res.data.items) renderVoChestItems(res.data.items);
+      } catch (err) {
+        showVoToast(false, `开箱失败: ${err.message}`);
+      }
+      pollVisualObject();
+    };
+
+    async function pollVisualObject() {
+      try {
+        const resp = await fetch('/api/visual_object/state', { cache: 'no-store' });
+        const d = await resp.json();
+        const badge = document.getElementById('voStatusBadge');
+        if (!d.ok && d.available === false) {
+          badge.textContent = '未运行';
+          badge.className = 'badge warn';
+          document.getElementById('voMetaLine').textContent = d.detail || 'visual_object 服务未启动';
+          return;
+        }
+        badge.textContent = d.busy ? (d.busy_detail || '执行中') : 'Active';
+        badge.className = d.busy ? 'badge warn' : 'badge ok';
+
+        const det = d.detector || {};
+        const detTag = det.onnx_enabled ? 'ONNX+Classic' : `Classic(${(det.classic_labels || []).join(',')})`;
+        document.getElementById('voMetaLine').textContent =
+          `${detTag} · 帧:${d.frames_processed || 0} · 2D:${d.last_2d_count || 0} · 3D:${d.last_3d_count || 0}`;
+
+        const sel = document.getElementById('voScanLabel');
+        const specs = d.specs || [];
+        if (specs.length && sel.options.length !== specs.length) {
+          const prev = sel.value;
+          sel.innerHTML = specs.map(s => `<option value="${s.label}">${s.display_name} (${s.label})</option>`).join('');
+          if (prev) sel.value = prev;
+        }
+
+        const objs = d.objects || [];
+        voObjects = objs;
+        document.getElementById('voObjCountBadge').textContent = String(objs.length);
+        document.getElementById('tabVoCount').textContent = objs.length ? `(${objs.length})` : '';
+
+        const tb = document.getElementById('voObjBody');
+        if (!objs.length) {
+          tb.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">暂无已确认目标（点击上方「扫描方块」）</td></tr>';
+        } else {
+          tb.innerHTML = objs.map(o => {
+            const tags = [];
+            if (o.status === 'remembered') tags.push('(记忆)');
+            if (typeof o.trust_remaining_s === 'number') tags.push(`(相信 ${o.trust_remaining_s.toFixed(0)}s)`);
+            const tagHtml = tags.length ? ` <span style="color:var(--muted);font-size:10px">${tags.join(' ')}</span>` : '';
+            return `
+            <tr class="${o.visual_id === voSelectedId ? 'selected' : ''}" onclick="selectVoObj('${o.visual_id}')">
+              <td><strong>${o.visual_id}</strong>${tagHtml}</td>
+              <td>${Number(o.distance_m).toFixed(2)}m</td>
+              <td>${Number(o.width_m).toFixed(2)}×${Number(o.height_m).toFixed(2)}</td>
+              <td>${Math.round(o.confidence * 100)}%</td>
+              <td><button type="button" onclick="event.stopPropagation(); quickVoInspect('${o.visual_id}')">开箱</button></td>
+            </tr>`;
+          }).join('');
+        }
+        if (d.last_inspect && d.last_inspect.items) {
+          renderVoChestItems(d.last_inspect.items);
+        }
+        render();
+      } catch (err) {}
+    }
+
+    function refreshVoPreview() {
+      if (activeTab !== 'vo' || paused) return;
+      const img = document.getElementById('voPreviewImg');
+      if (img) img.src = `/api/visual_object/preview.jpg?t=${Date.now()}`;
+    }
+
+    document.getElementById('voBtnScan').addEventListener('click', async () => {
+      const label = document.getElementById('voScanLabel').value || 'chest';
+      const sweep = document.getElementById('voChkSweep').checked;
+      showVoToast(true, `正在扫描 ${label} (360°=${sweep})...`);
+      try {
+        const res = await postVoJson('scan', { label, sweep, max_distance_m: 10.0 });
+        showVoToast(res.ok, res.data.detail || `扫描完成，发现 ${res.data.count || 0} 个目标`);
+      } catch (err) {
+        showVoToast(false, `扫描失败: ${err.message}`);
+      }
+      pollVisualObject();
+    });
+    document.getElementById('voBtnClear').addEventListener('click', async () => {
+      voSelectedId = '';
+      document.getElementById('voSelLabel').textContent = '自动选最近';
+      try {
+        const res = await postVoJson('clear', {});
+        showVoToast(res.ok, res.data.detail || '已清空');
+      } catch (err) {
+        showVoToast(false, `清空失败: ${err.message}`);
+      }
+      pollVisualObject();
+    });
+    document.getElementById('voBtnApproach').addEventListener('click', async () => {
+      showVoToast(true, `正在走近 ${voSelectedId || '最近箱子'}...`);
+      try {
+        const res = await postVoJson('approach', { visual_id: voSelectedId, label: 'chest' });
+        showVoToast(res.ok, res.data.detail || '已到达');
+      } catch (err) {
+        showVoToast(false, `走近失败: ${err.message}`);
+      }
+      pollVisualObject();
+    });
+    document.getElementById('voBtnInspect').addEventListener('click', async () => {
+      showVoToast(true, `正在走近并开箱检查 ${voSelectedId || '最近箱子'}...`);
+      try {
+        const res = await postVoJson('inspect', { visual_id: voSelectedId });
+        showVoToast(res.ok, res.data.detail || '检查完成');
+        if (res.data.items) renderVoChestItems(res.data.items);
+      } catch (err) {
+        showVoToast(false, `开箱失败: ${err.message}`);
+      }
+      pollVisualObject();
+    });
+    document.getElementById('voBtnWithdraw').addEventListener('click', async () => {
+      const item = document.getElementById('voItemInput').value.trim();
+      const count = Number(document.getElementById('voCountInput').value || 1);
+      showVoToast(true, `正在取出 ${count}×${item}...`);
+      try {
+        const res = await postVoJson('withdraw', { visual_id: voSelectedId, item, count });
+        showVoToast(res.ok, res.data.detail || '取出完成');
+      } catch (err) {
+        showVoToast(false, `取物失败: ${err.message}`);
+      }
+      pollVisualObject();
+    });
+    document.getElementById('voBtnDeposit').addEventListener('click', async () => {
+      const item = document.getElementById('voItemInput').value.trim();
+      const count = Number(document.getElementById('voCountInput').value || 1);
+      showVoToast(true, `正在放入 ${count}×${item}...`);
+      try {
+        const res = await postVoJson('deposit', { visual_id: voSelectedId, item, count });
+        showVoToast(res.ok, res.data.detail || '放入完成');
+      } catch (err) {
+        showVoToast(false, `放物失败: ${err.message}`);
+      }
+      pollVisualObject();
+    });
+
+    if (window.location.hash === '#visual_object') {
+      switchTab('vo');
+    }
+
+    resizeCanvas();
+    poll();
+    pollVisualObject();
+    restartPolling();
+    setInterval(pollVisualObject, 1200);
+    setInterval(refreshVoPreview, 550);
+  </script>
+</body>
+</html>
