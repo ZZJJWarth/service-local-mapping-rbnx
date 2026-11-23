@@ -40,6 +40,7 @@ class RollingGrid:
         self.origin_y = -self.size / 2.0
         self.robot_x = 0.0
         self.robot_y = 0.0
+        self.robot_ground_z = float("nan")
         self.log_odds = np.zeros((self.n, self.n), dtype=np.float32)
         self.ground_z = np.full((self.n, self.n), np.nan, dtype=np.float32)
         self.obstacle_z = np.full((self.n, self.n), np.nan, dtype=np.float32)
@@ -94,6 +95,7 @@ class RollingGrid:
             self.robot_y = float(robot_xy[1])
         self.origin_x = self.robot_x - self.size / 2.0
         self.origin_y = self.robot_y - self.size / 2.0
+        self.robot_ground_z = float("nan")
         self.log_odds.fill(0.0)
         self.ground_z.fill(np.nan)
         self.obstacle_z.fill(np.nan)
@@ -146,6 +148,7 @@ class RollingGrid:
         if points.size == 0:
             return 0
         ox, oy = float(origin_xy[0]), float(origin_xy[1])
+        self.robot_ground_z = float(ground_reference_z)
         accepted = 0
         min_z = ground_reference_z + self.cfg.obstacle_min_height_m
         max_z = ground_reference_z + self.cfg.obstacle_max_height_m
@@ -255,6 +258,7 @@ class RollingGrid:
         """Cluster map-frame depth returns per cell into ground and obstacles."""
         if points.size == 0:
             return 0
+        self.robot_ground_z = float(robot_ground_z)
         pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
         pts = pts[np.isfinite(pts).all(axis=1)]
         if pts.size == 0:
@@ -272,27 +276,104 @@ class RollingGrid:
         zs = pts[order, 2]
         unique, starts = np.unique(flat, return_index=True)
         ends = np.r_[starts[1:], len(flat)]
+
+        # Seed robot's immediate ground cell so 2.5D elevation smoothly propagates up/down stairs.
+        rc_col, rc_row = self.world_to_index(self.robot_x, self.robot_y)
+        if 0 <= int(rc_col) < self.n and 0 <= int(rc_row) < self.n:
+            cur_rg = self.ground_z[int(rc_row), int(rc_col)]
+            self.ground_z[int(rc_row), int(rc_col)] = (
+                float(robot_ground_z)
+                if not np.isfinite(cur_rg)
+                else 0.65 * float(cur_rg) + 0.35 * float(robot_ground_z)
+            )
+
+        # Process cells from nearest to farthest so neighbor ground_z climbs stairs step-by-step.
+        u_rows = unique // self.n
+        u_cols = unique % self.n
+        u_wx, u_wy = self.index_to_world(u_cols, u_rows)
+        dist2 = (u_wx - self.robot_x) ** 2 + (u_wy - self.robot_y) ** 2
+        dist_order = np.argsort(dist2, kind="stable")
+
         accepted = 0
         percentile = float(self.cfg.ground_percentile)
-        for idx, start, end in zip(unique, starts, ends):
-            r, c = divmod(int(idx), self.n)
-            cell_z = zs[start:end]
+        step_h = float(self.cfg.step_height_m)
+        for k in dist_order.tolist():
+            r = int(u_rows[k])
+            c = int(u_cols[k])
+            cell_z = zs[starts[k]:ends[k]]
             z_min = float(np.min(cell_z))
             z_max = float(np.max(cell_z))
+            span = z_max - z_min
+
             tracked = self.ground_z[r, c]
-            local_ground = float(tracked) if np.isfinite(tracked) else float(robot_ground_z)
-            # A depth cluster that rises well above the local ground is an
-            # obstacle; a low cluster seeds or updates the ground estimate.
-            if z_max - local_ground > self.cfg.step_height_m:
-                if z_max - local_ground <= self.cfg.obstacle_max_height_m:
-                    self._mark_occupied(c, r, z_max, stamp)
-                    accepted += 1
-                continue
-            candidate = float(np.percentile(cell_z, percentile))
-            self.ground_z[r, c] = candidate if not np.isfinite(tracked) else (
-                0.75 * float(tracked) + 0.25 * candidate
+            if np.isfinite(tracked):
+                local_ground = float(tracked)
+            else:
+                # 5x5 (+-0.4m) neighborhood bridges depth_stride gaps on ascending/descending stairs;
+                # pick the neighbor elevation closest to this surface's base z_min.
+                r0, r1 = max(0, r - 2), min(self.n, r + 3)
+                c0, c1 = max(0, c - 2), min(self.n, c + 3)
+                nb = self.ground_z[r0:r1, c0:c1]
+                nb_fin = nb[np.isfinite(nb)]
+                if nb_fin.size > 0:
+                    local_ground = float(nb_fin[int(np.argmin(np.abs(nb_fin - z_min)))])
+                else:
+                    local_ground = float(robot_ground_z)
+
+            # A vertical face (span > step_h) or an elevated block whose base rises > step_h
+            # above neighbor ground is an obstacle; a flat/stepped tread whose base connects
+            # within step_h (OR rises along a <= 49 deg stair ramp through the camera's near-field
+            # blind spot where LiDAR has already confirmed free passage, log_odds < 0) updates ground_z!
+            lidar_cleared_ramp = (
+                span <= step_h
+                and float(self.log_odds[r, c]) < -0.05
+                and (z_min - float(robot_ground_z)) > 0.0
+                and (z_min - float(robot_ground_z)) <= math.hypot(float(u_wx[k]) - self.robot_x, float(u_wy[k]) - self.robot_y) * 1.15 + 0.25
             )
+            at_robot_floor = (
+                span <= step_h
+                and abs(z_min - float(robot_ground_z)) <= step_h
+                and abs(z_max - float(robot_ground_z)) <= step_h
+            )
+            if not lidar_cleared_ramp and not at_robot_floor and ((z_min - local_ground) > step_h or span > step_h):
+                if (z_max - local_ground) > step_h:
+                    # Upward vertical wall / obstacle rising above local_ground.
+                    if (z_max - local_ground) <= self.cfg.obstacle_max_height_m:
+                        self._mark_occupied(c, r, z_max, stamp)
+                        accepted += 1
+                    continue
+                # Downward vertical pit wall: only trust if a robust cluster (>= 4 pts, median
+                # clearly below local_ground) confirms a real drop — never a single noisy outlier!
+                if cell_z.size >= 4 and float(np.percentile(cell_z, 50.0)) < local_ground - step_h:
+                    pit_z = float(np.percentile(cell_z, 25.0))
+                    self.ground_z[r, c] = pit_z if not np.isfinite(tracked) else (
+                        0.4 * float(tracked) + 0.6 * pit_z
+                    )
+                    self.seen[r, c] = min(int(self.seen[r, c]) + 1, 65535)
+                continue
+            eff_pct = 80.0 if span > 0.15 else percentile
+            candidate = float(np.percentile(cell_z, eff_pct))
+            if not np.isfinite(tracked):
+                new_g = candidate
+            elif at_robot_floor and abs(float(tracked) - candidate) > step_h:
+                new_g = candidate
+            elif (float(tracked) - candidate) > step_h and cell_z.size >= 3:
+                new_g = 0.35 * float(tracked) + 0.65 * candidate
+            else:
+                new_g = 0.75 * float(tracked) + 0.25 * candidate
+            self.ground_z[r, c] = new_g
             self.seen[r, c] = min(int(self.seen[r, c]) + 1, 65535)
+            # Clear stale obstacle ghosts (e.g. old stair-riser hits) once depth confirms
+            # this cell is a walkable tread/floor at or near the old obstacle height.
+            old_obs = self.obstacle_z[r, c]
+            if np.isfinite(old_obs) and old_obs <= new_g + step_h:
+                self.log_odds[r, c] = max(
+                    float(self.log_odds[r, c]) - self.cfg.log_odds_occupied,
+                    self.cfg.log_odds_min,
+                )
+                if self.log_odds[r, c] < 0.2:
+                    self.stale_obstacle[r, c] = False
+                    self.obstacle_z[r, c] = np.nan
         return accepted
 
     def integrate_semantic(self, points: np.ndarray, cost: int, stamp: float) -> int:
@@ -352,8 +433,17 @@ class RollingGrid:
 
         log_odds = self.log_odds[sl_src]
         seen = self.seen[sl_src]
-        occupied = (seen > 0) & (log_odds >= 0.5)
-        free = (seen > 0) & (log_odds <= 0.1)
+        obs_z_win = self.obstacle_z[sl_src]
+        # Height-band filter: ignore stale obstacles from a different floor/elevation slice
+        # when the robot climbs or descends stairs.
+        if math.isfinite(self.robot_ground_z):
+            z_lo = self.robot_ground_z + self.cfg.obstacle_min_height_m - 0.35
+            z_hi = self.robot_ground_z + self.cfg.obstacle_max_height_m + 0.35
+            in_height_band = ~np.isfinite(obs_z_win) | ((obs_z_win >= z_lo) & (obs_z_win <= z_hi))
+        else:
+            in_height_band = np.ones_like(log_odds, dtype=bool)
+        occupied = (seen > 0) & (log_odds >= 0.5) & in_height_band
+        free = (seen > 0) & ((log_odds <= 0.1) | ~in_height_band)
         uncertain = (seen > 0) & ~occupied & ~free
         block = cost[sl_dst]
         block[...] = UNKNOWN
@@ -370,9 +460,9 @@ class RollingGrid:
             ) ** 2
             in_obs = dist2 <= (self.cfg.observation_radius_m ** 2)
             fresh_occupied = occupied & in_obs
-            stale_mask = (occupied & ~in_obs) | (
-                self.stale_obstacle[sl_src] & ~fresh_occupied
-            )
+            stale_mask = ((occupied & ~in_obs) | (
+                self.stale_obstacle[sl_src] & in_height_band & ~fresh_occupied
+            ))
             block[stale_mask] = np.int8(self.cfg.stale_obstacle_cost)
             block[fresh_occupied] = LETHAL
         else:
@@ -387,11 +477,31 @@ class RollingGrid:
             block_sem[semantic_mask], semantic[semantic_mask].astype(np.int8)
         )
 
-        # A steep ground cell is not collision-free even without a vertical return.
+        # 2.5D Traversability (depth-camera layer; near-field >= 1.55 m pits are owned by the
+        # exact downward-pitched LiDAR cliff scanner with zero lip-occlusion artifacts):
+        #  - <= 1.5 m step (0.5 m stairs / 1-block steps): fully walkable (cost 0)
+        #  - 1.5..drop_off_height_m (e.g. occluded downward staircase lip seen from horizontal camera):
+        #    gentle caution (cost 25) so robot walks up to the edge and lets the downward LiDAR
+        #    verify whether it is walkable stairs (occ=0) or a >= 2-block pit (occ=LETHAL)
+        #  - > drop_off_height_m (default 3.5 m, unmistakable rooftop/cliff drop): LETHAL (100)
         ground = self.ground_z[sl_src]
-        slopes = self._slope(ground)
-        steep = np.isfinite(slopes) & (slopes > math.radians(self.cfg.slope_max_deg))
-        block_sem[steep] = np.maximum(block_sem[steep], 90)
+        max_step = self._max_neighbor_step(ground)
+        drop_h = float(self.cfg.drop_off_height_m)
+        cliff = np.isfinite(max_step) & (max_step > drop_h)
+        block_sem[cliff] = LETHAL
+        caution_drop = np.isfinite(max_step) & (max_step > 1.50) & (max_step <= drop_h)
+        block_sem[caution_drop] = np.maximum(block_sem[caution_drop], 25)
+        # Macro slope over ~0.8 m span: gentle preference for flat ground without blocking stairs.
+        macro_tan = self._macro_slope_tan(ground)
+        steep_step_guard = max(1.50, float(self.cfg.step_height_m) + 0.95)
+        steep = (
+            np.isfinite(macro_tan)
+            & (macro_tan > math.tan(math.radians(self.cfg.slope_max_deg)))
+            & np.isfinite(max_step)
+            & (max_step > steep_step_guard)
+            & ~cliff
+        )
+        block_sem[steep] = np.maximum(block_sem[steep], 45)
 
         if self.cfg.wall_aversion_radius_m > 0.0 and self.cfg.wall_aversion_max_cost > 0:
             repulsion = self._wall_aversion(block >= LETHAL)
@@ -455,15 +565,36 @@ class RollingGrid:
             out[band] = np.clip(np.rint(max_cost * falloff), 1, max_cost).astype(np.int8)
         return out
 
-    def _slope(self, ground: np.ndarray) -> np.ndarray:
+    def _max_neighbor_step(self, ground: np.ndarray) -> np.ndarray:
+        """Maximum absolute elevation step |Δz| between each cell and its 4-neighbors."""
+        step = np.full(ground.shape, np.nan, dtype=np.float32)
+        if ground.shape[0] > 1:
+            dv = np.abs(np.diff(ground, axis=0))
+            step[:-1, :] = np.fmax(step[:-1, :], dv)
+            step[1:, :] = np.fmax(step[1:, :], dv)
+        if ground.shape[1] > 1:
+            dh = np.abs(np.diff(ground, axis=1))
+            step[:, :-1] = np.fmax(step[:, :-1], dh)
+            step[:, 1:] = np.fmax(step[:, 1:], dh)
+        return step
+
+    def _macro_slope_tan(self, ground: np.ndarray) -> np.ndarray:
+        """Macroscopic terrain slope tan(theta) across ~0.8 m span (smooth over stair risers)."""
+        k = max(1, int(round(0.8 / max(0.05, self.res))))
+        span_m = float(k) * float(self.res)
         slope = np.full(ground.shape, np.nan, dtype=np.float32)
-        diff = np.full(ground.shape, np.nan, dtype=np.float32)
-        diff[:-1, :] = np.abs(np.diff(ground, axis=0)) / self.res
-        slope = np.where(np.isnan(slope), diff, np.fmax(slope, diff))
-        diff = np.full(ground.shape, np.nan, dtype=np.float32)
-        diff[:, :-1] = np.abs(np.diff(ground, axis=1)) / self.res
-        slope = np.where(np.isnan(slope), diff, np.fmax(slope, diff))
+        if ground.shape[0] > k:
+            dv = np.abs(ground[k:, :] - ground[:-k, :]) / span_m
+            slope[:-k, :] = np.fmax(slope[:-k, :], dv)
+            slope[k:, :] = np.fmax(slope[k:, :], dv)
+        if ground.shape[1] > k:
+            dh = np.abs(ground[:, k:] - ground[:, :-k]) / span_m
+            slope[:, :-k] = np.fmax(slope[:, :-k], dh)
+            slope[:, k:] = np.fmax(slope[:, k:], dh)
         return slope
+
+    def _slope(self, ground: np.ndarray) -> np.ndarray:
+        return self._macro_slope_tan(ground)
 
     def stats(self) -> dict[str, int]:
         return {

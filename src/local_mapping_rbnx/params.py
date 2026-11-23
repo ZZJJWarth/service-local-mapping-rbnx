@@ -51,6 +51,7 @@ TOP_LEVEL_KEYS = {
     "lidar_max_range_m",
     "ground_percentile",
     "step_height_m",
+    "drop_off_height_m",
     "slope_max_deg",
     "obstacle_min_height_m",
     "obstacle_max_height_m",
@@ -111,7 +112,8 @@ class MapConfig:
     lidar_max_range_m: float = 32.0
     ground_percentile: float = 10.0
     step_height_m: float = 0.55
-    slope_max_deg: float = 35.0
+    drop_off_height_m: float = 3.5
+    slope_max_deg: float = 56.0
     obstacle_min_height_m: float = 0.05
     obstacle_max_height_m: float = 2.0
     log_odds_free: float = 0.4
@@ -333,7 +335,8 @@ def from_config(config: dict[str, Any], package_root: Path) -> MapConfig:
         lidar_max_range_m=lidar_max,
         ground_percentile=_number(config.get("ground_percentile", 10.0), "ground_percentile", 1, 50),
         step_height_m=_number(config.get("step_height_m", 0.55), "step_height_m", 0.05, 2),
-        slope_max_deg=_number(config.get("slope_max_deg", 35.0), "slope_max_deg", 5, 60),
+        drop_off_height_m=_number(config.get("drop_off_height_m", 1.25), "drop_off_height_m", 0.4, 5.0),
+        slope_max_deg=_number(config.get("slope_max_deg", 56.0), "slope_max_deg", 5, 65),
         obstacle_min_height_m=obstacle_min,
         obstacle_max_height_m=obstacle_max,
         log_odds_free=log_free,

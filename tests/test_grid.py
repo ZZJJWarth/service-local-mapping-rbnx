@@ -234,3 +234,109 @@ def test_reset_clears_all_grid_layers_and_recenters():
     assert grid.stats()["stale_obstacle_cells"] == 0
     assert abs(grid.center_x - 10.0) < 1e-6
     assert abs(grid.center_y - (-5.0)) < 1e-6
+
+
+def test_stairs_25d_walkable_while_cliff_is_lethal_and_height_band_filters_old_floor():
+    grid = RollingGrid(
+        make_cfg(
+            grid_size_m=16,
+            publish_size_m=8,
+            step_height_m=0.55,
+            drop_off_height_m=1.25,
+            slope_max_deg=52.0,
+        )
+    )
+    # 1. Build a 45-deg Minecraft staircase rising from x=0.2..3.0 (0.5 m step every 0.5 m)
+    stair_pts = []
+    for i in range(1, 15):
+        x = i * 0.2
+        z = (i // 2) * 0.45  # smooth ascending steps <= 0.55 m per neighbor
+        for y in (-0.4, -0.2, 0.0, 0.2, 0.4):
+            stair_pts.append([x, y, z])
+    hits = grid.integrate_depth(np.asarray(stair_pts, dtype=np.float64), 1.0, 0.0)
+    assert hits == 0, "ascending 45-deg stair treads must NOT be classified as obstacles"
+
+    win = grid.window((0.0, 0.0))
+    for x_chk in (0.6, 1.2, 1.8, 2.4):
+        r, c = window_indices(grid, x_chk, 0.0)
+        assert win.cost[r, c] == 0, f"stair cell at x={x_chk} should be walkable (0), got {win.cost[r, c]}"
+
+    # 2. Sharp unguarded cliff drop-off (> 1.25 m) next to walkway -> LETHAL
+    col_a, row_a = grid.world_to_index(0.1, 2.1)
+    col_b, row_b = grid.world_to_index(0.3, 2.1)
+    assert col_b == col_a + 1
+    grid.ground_z[int(row_a), int(col_a)] = 0.0
+    grid.ground_z[int(row_b), int(col_b)] = -2.5
+    grid.seen[int(row_a), int(col_a)] = 3
+    grid.seen[int(row_b), int(col_b)] = 3
+    win2 = grid.window((0.0, 0.0))
+    ra, ca = window_indices(grid, 0.1, 2.1)
+    assert win2.cost[ra, ca] == LETHAL
+
+    # 3. Height-band filtering when robot climbs to 2F (z = 5.0): old 1F wall at z = 1.0 fades out!
+    grid.integrate_lidar((0.0, 0.0), np.asarray([[-2.0, 0.0, 1.0]]), 2.0, 0.0)
+    r_w, c_w = window_indices(grid, -2.0, 0.0)
+    assert grid.window((0.0, 0.0)).cost[r_w, c_w] == LETHAL
+    # Now robot is at z = 5.0 (2F)
+    grid.integrate_lidar((0.0, 0.0), np.asarray([[3.0, 0.0, 6.0]]), 3.0, 5.0)
+    win_2f = grid.window((0.0, 0.0))
+    assert win_2f.cost[r_w, c_w] == 0, "1F wall at z=1.0 must not block 2F robot at z=5.0"
+
+    # 4. Camera near-field blind spot (no depth at 0.2..1.0 m, first stair pixel at dx=1.4 m, z=+1.0 m)
+    #    where LiDAR stair-tracer already cleared free space through to a 6 m wall: must stay walkable (0)!
+    g_bs = RollingGrid(make_cfg(grid_size_m=16, publish_size_m=8, step_height_m=0.55))
+    g_bs.integrate_lidar((0.0, 0.0), np.asarray([[6.0, 0.0, 0.6]]), 1.0, 0.0)
+    bs_hits = g_bs.integrate_depth(np.asarray([[1.4, 0.0, 1.0], [1.6, 0.0, 1.2]]), 1.1, 0.0)
+    assert bs_hits == 0
+    r_bs, c_bs = window_indices(g_bs, 1.4, 0.0)
+    assert g_bs.window((0.0, 0.0)).cost[r_bs, c_bs] == 0
+
+    # 5. 1-block downward step (1.0 m) and occluded downward stair lip (2.0 m shadow) must remain
+    #    passable (NOT LETHAL, letting downward LiDAR verify stairs vs pit), while a 4.0 m cliff is LETHAL!
+    g_down = RollingGrid(make_cfg(grid_size_m=16, publish_size_m=8, drop_off_height_m=3.5))
+    # 1.0 m downward step
+    c1, r1 = g_down.world_to_index(0.5, 0.1)
+    c2, r2 = g_down.world_to_index(0.7, 0.1)
+    g_down.ground_z[int(r1), int(c1)] = 0.0
+    g_down.ground_z[int(r2), int(c2)] = -1.0
+    g_down.seen[int(r1), int(c1)] = 3
+    g_down.seen[int(r2), int(c2)] = 3
+    # 2.0 m occluded downward stair lip (horizontal camera shadow) -> soft caution, NOT LETHAL
+    c3, r3 = g_down.world_to_index(0.5, 1.5)
+    c4, r4 = g_down.world_to_index(0.7, 1.5)
+    g_down.ground_z[int(r3), int(c3)] = 0.0
+    g_down.ground_z[int(r4), int(c4)] = -2.0
+    g_down.seen[int(r3), int(c3)] = 3
+    g_down.seen[int(r4), int(c4)] = 3
+    # 4.0 m unmistakable rooftop/cliff drop via integrate_depth -> LETHAL
+    g_down.integrate_depth(
+        np.asarray([[1.1, -1.5, 0.0], [1.3, -1.5, 0.0], [1.5, -1.5, 0.0]], dtype=np.float64),
+        1.0,
+        0.0,
+    )
+    pit_pts = np.asarray(
+        [[1.3, -1.5, -4.0], [1.3, -1.5, -4.0], [1.3, -1.5, -4.0], [1.3, -1.5, -4.0]],
+        dtype=np.float64,
+    )
+    for k in range(3):
+        g_down.integrate_depth(pit_pts, 2.0 + k * 0.1, 0.0)
+    w_down = g_down.window((0.0, 0.0))
+    ra1, ca1 = window_indices(g_down, 0.5, 0.1)
+    ra3, ca3 = window_indices(g_down, 0.5, 1.5)
+    ra5, ca5 = window_indices(g_down, 1.3, -1.5)
+    assert w_down.cost[ra1, ca1] == 0
+    assert 0 < w_down.cost[ra3, ca3] <= 45
+    assert w_down.cost[ra5, ca5] == LETHAL
+
+    # 6. Flat road with a single noisy low-z outlier pixel MUST stay walkable (0) and never poison road!
+    g_flat = RollingGrid(make_cfg(grid_size_m=16, publish_size_m=8, drop_off_height_m=1.65))
+    g_flat.integrate_depth(
+        np.asarray([[1.5, 0.0, 0.0], [1.5, 0.0, 0.0], [1.5, 0.0, 0.0], [1.5, 0.0, -2.5]], dtype=np.float64),
+        1.0,
+        0.0,
+    )
+    g_flat.integrate_depth(np.asarray([[1.5, 0.0, 0.0], [1.5, 0.0, 0.0]], dtype=np.float64), 1.1, 0.0)
+    rf, cf = window_indices(g_flat, 1.5, 0.0)
+    wf = g_flat.window((0.0, 0.0))
+    assert wf.cost[rf, cf] == 0
+    assert wf.occupancy[rf, cf] == 0
